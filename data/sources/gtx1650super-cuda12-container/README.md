@@ -42,8 +42,12 @@ SYBIL_STORE=$(mktemp -d /path/to/roomy-disk/sybil-1650.XXXXXX) || exit 1
 mkdir -p "$SYBIL_STORE/tmp" || exit 1
 export TMPDIR="$SYBIL_STORE/tmp"
 SYBIL_PODMAN=(podman --root "$SYBIL_STORE/root" --runroot "$SYBIL_STORE/run" --tmpdir "$SYBIL_STORE/tmp")
+save_server_log() {
+  timeout 20 "${SYBIL_PODMAN[@]}" logs "$(cat "$SYBIL_STORE/container.cid")" > "$SYBIL_STORE/server.log" 2>&1
+}
 cleanup() {
   if [ -s "$SYBIL_STORE/container.cid" ]; then
+    save_server_log || true
     timeout 20 "${SYBIL_PODMAN[@]}" rm -f "$(cat "$SYBIL_STORE/container.cid")" >/dev/null || true
   fi
 }
@@ -70,7 +74,16 @@ done
 [ "$SYBIL_READY" = yes ] || { echo 'server did not become healthy' >&2; exit 1; }
 timeout 3600 python3 lab/lab.py try LiquidAI/LFM2.5-2.6B-GGUF@84022ce711b28455e8c4fc364ce68c00cf995875 \
   --model lfm2.5-2.6b --engine llama.cpp-lfm2.5-2.6b-qad-q4-0-64k-gtx1650super-cuda12 \
-  --card gtx-1650-super-4gb --on endpoint --endpoint http://127.0.0.1:18080 --gpu 'NVIDIA GeForce GTX 1650 SUPER'
+  --card gtx-1650-super-4gb --on endpoint --endpoint http://127.0.0.1:18080 --gpu 'NVIDIA GeForce GTX 1650 SUPER' || exit 1
+save_server_log || exit 1
+[ "$(grep -c 'stop processing:.*truncated = 0' "$SYBIL_STORE/server.log")" -eq 6 ] || {
+  echo 'expected six naturally completed requests; inspect the saved server.log' >&2
+  exit 1
+}
+if grep -q 'truncated = 1' "$SYBIL_STORE/server.log"; then
+  echo 'a request hit the context limit; this run does not qualify' >&2
+  exit 1
+fi
 ~~~
 
-The example uses the measured image, weights, inference arguments and WSL GPU mapping. Its bounded lifecycle and isolated storage paths are reproduction helpers. Keep the server log and confirm natural completion before accepting a new run. The task-local image store remains available after cleanup.
+The example uses the measured image, weights, inference arguments and WSL GPU mapping. Its bounded lifecycle and isolated storage paths are reproduction helpers. It saves the server log before removing the container and requires all six requests to finish naturally. The log and task-local image store remain available after cleanup.
