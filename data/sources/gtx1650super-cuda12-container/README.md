@@ -18,7 +18,7 @@ A 4 GB card is under the registry's 8 GB KV-floor threshold, so the 131,072-toke
 ## Machine
 
 - WSL2 (kernel 6.6.87.2-microsoft-standard-WSL2) on a Windows host, NVIDIA driver 595.95, PCIe gen 3 x16, AMD Ryzen 5 3600, 29.43 GB RAM ([kit probe](../../lab-runs/20261023-gtx-1650-super-4gb.probe.json)).
-- Rootless Podman 6.1.4. WSL has no NVIDIA Container Toolkit here, so the GPU reached the container through WSL's own paravirtual device: `--device /dev/dxg -v /usr/lib/wsl:/usr/lib/wsl:ro -e LD_LIBRARY_PATH=/usr/lib/wsl/lib`. On a Linux host with the toolkit, `--gpus all` is the equivalent; the image, argv and weights are the recipe's.
+- Rootless Podman 6.1.4. WSL has no NVIDIA Container Toolkit here, so the GPU reached the container through WSL's own paravirtual device: `--device /dev/dxg -v /usr/lib/wsl:/usr/lib/wsl:ro -e LD_LIBRARY_PATH=/usr/lib/wsl/lib`. A native Linux launch with the NVIDIA Container Toolkit was not measured in this run.
 - The kit's `tools/memwatch.sh` needs `bc`, which this host lacks, so memory was recorded once a second by a separately labelled native watcher with the same columns plus GPU utilisation, power and SM clock: [memwatch-native.csv](../../lab-runs/20261023-gtx-1650-super-4gb.memwatch-native.csv).
 - No clock, power or fan change; no output cap; no thinking budget.
 
@@ -28,21 +28,49 @@ A 4 GB card is under the registry's 8 GB KV-floor threshold, so the 131,072-toke
 - Weights: LiquidAI/LFM2.5-2.6B-GGUF@84022ce711b28455e8c4fc364ce68c00cf995875; file LFM2.5-2.6B-QAD-Q4_0.gguf; 1,593,894,944 bytes; SHA256 a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03.
 - [Raw lab run JSON](../../lab-runs/gtx-1650-super-4gb.lfm2.5-2.6b.llama.cpp-lfm2.5-2.6b-qad-q4-0-64k-gtx1650super-cuda12.64k.20261023T195935.json); raw-file SHA256 055bb51a20461e0f74780c03b127eee5676ccef47fa0984b2ec6de90fb493f8f. Recipe log hash sha256:d8b66c6bb9c424e1 (the lab hashes the text before its final newline).
 - Rendered launch SHA256: 636317017b0cee372cd35a07081b3f5550b68f0a183e29c66d5f2304eb831114.
-- The kit reference panel and sweep apply only to Qwen3.8-Flash-Next and were not run; no panel result is claimed.
+- The kit's published target and reference panel are for Qwen3.8-Flash-Next. Neither that panel nor the full kit speed sweep was run. This submission records the registry's six lab gates.
+- [Server log](../../lab-runs/20261023-gtx-1650-super-4gb.server.log): the speed request ends with `truncated = 0`.
 
-## Reproduction
+## Reproduction on the measured WSL host
+
+Use Python 3.11 or newer for the registry checks. Place the pinned weight file and task-local Podman storage on a volume with enough physical free space. The WSL root disk's reported virtual capacity does not establish host free space.
 
 ~~~bash
 MODEL_DIR=/path/to/LFM2.5-2.6B-GGUF-84022ce7
 IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda12-b11146@sha256:52192a23c7b258044463aebba78826cdff39a7393b713edc313324b343a7b836
-echo "a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03  $MODEL_DIR/LFM2.5-2.6B-QAD-Q4_0.gguf" | sha256sum -c -
-docker run -d --name lfm-1650 --gpus all -p 127.0.0.1:18080:8080 -v "$MODEL_DIR":/models:ro \
+SYBIL_STORE=$(mktemp -d /path/to/roomy-disk/sybil-1650.XXXXXX) || exit 1
+mkdir -p "$SYBIL_STORE/tmp" || exit 1
+export TMPDIR="$SYBIL_STORE/tmp"
+SYBIL_PODMAN=(podman --root "$SYBIL_STORE/root" --runroot "$SYBIL_STORE/run" --tmpdir "$SYBIL_STORE/tmp")
+cleanup() {
+  if [ -s "$SYBIL_STORE/container.cid" ]; then
+    timeout 20 "${SYBIL_PODMAN[@]}" rm -f "$(cat "$SYBIL_STORE/container.cid")" >/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+echo "a247afd6414918eac8e520a9e6137dc271235461ecbe1180462221d5b8d40b03  $MODEL_DIR/LFM2.5-2.6B-QAD-Q4_0.gguf" | sha256sum -c - || exit 1
+timeout 600 "${SYBIL_PODMAN[@]}" pull "$IMAGE" || exit 1
+timeout 60 "${SYBIL_PODMAN[@]}" run -d --cidfile "$SYBIL_STORE/container.cid" \
+  --device /dev/dxg -v /usr/lib/wsl:/usr/lib/wsl:ro -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+  -p 127.0.0.1:18080:8080 -v "$MODEL_DIR":/models:ro \
   --entrypoint /app/llama-server "$IMAGE" \
   -m /models/LFM2.5-2.6B-QAD-Q4_0.gguf --alias lfm2.5-2.6b --host 0.0.0.0 --port 8080 \
   --ctx-size 65536 --n-gpu-layers 999 --flash-attn auto --cache-type-k f16 --cache-type-v f16 \
-  --jinja --reasoning-format deepseek --parallel 1 --batch-size 512 --ubatch-size 128
-until curl -sf http://127.0.0.1:18080/health; do sleep 3; done
-python3 lab/lab.py try LiquidAI/LFM2.5-2.6B-GGUF@84022ce711b28455e8c4fc364ce68c00cf995875 \
+  --jinja --reasoning-format deepseek --parallel 1 --batch-size 512 --ubatch-size 128 || exit 1
+SYBIL_READY=no
+for SYBIL_ATTEMPT in $(seq 1 100); do
+  if timeout 5 curl --max-time 3 -sf http://127.0.0.1:18080/health >/dev/null; then
+    SYBIL_READY=yes
+    break
+  fi
+  sleep 3
+done
+[ "$SYBIL_READY" = yes ] || { echo 'server did not become healthy' >&2; exit 1; }
+timeout 3600 python3 lab/lab.py try LiquidAI/LFM2.5-2.6B-GGUF@84022ce711b28455e8c4fc364ce68c00cf995875 \
   --model lfm2.5-2.6b --engine llama.cpp-lfm2.5-2.6b-qad-q4-0-64k-gtx1650super-cuda12 \
   --card gtx-1650-super-4gb --on endpoint --endpoint http://127.0.0.1:18080 --gpu 'NVIDIA GeForce GTX 1650 SUPER'
 ~~~
+
+The example uses the measured image, weights, inference arguments and WSL GPU mapping. Its bounded lifecycle and isolated storage paths are reproduction helpers. Keep the server log and confirm natural completion before accepting a new run. The task-local image store remains available after cleanup.
