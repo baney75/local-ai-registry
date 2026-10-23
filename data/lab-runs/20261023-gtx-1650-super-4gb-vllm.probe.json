@@ -7,13 +7,13 @@
  },
  "ram": {
   "total_gb": 29.43,
-  "available_gb": 27.18,
+  "available_gb": 27.55,
   "swap_total_gb": 8.59,
-  "swap_used_gb": 1.96
+  "swap_used_gb": 1.91
  },
  "storage": {
-  "path": "/mnt/magnus/sybil-recipe-20261023/models",
-  "free_gb": 1780.76,
+  "path": "/mnt/magnus/sybil-awq-20261023/models",
+  "free_gb": 1756.93,
   "total_gb": 1967.81,
   "device": "/dev/sde1",
   "fstype": "ext4",
