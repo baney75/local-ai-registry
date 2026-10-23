@@ -1,0 +1,69 @@
+{
+ "recipe": {
+  "model": "lfm2.5-2.6b",
+  "weights": "LiquidAI/LFM2.5-2.6B-GGUF@84022ce711b28455e8c4fc364ce68c00cf995875",
+  "engine": "llama.cpp-lfm2.5-2.6b-qad-q4-0-64k-gtx1650super-cuda12@52192a23c7b2",
+  "set": {},
+  "card": "gtx-1650-super-4gb"
+ },
+ "where": {
+  "on": "owner",
+  "gpu": "NVIDIA GeForce GTX 1650 SUPER"
+ },
+ "passed": true,
+ "proof": {
+  "at": "2026-10-23",
+  "on": "owner",
+  "gpu": "NVIDIA GeForce GTX 1650 SUPER",
+  "launch_sha256": "636317017b0cee372cd35a07081b3f5550b68f0a183e29c66d5f2304eb831114",
+  "gates": "load chat reasoning tools context speed",
+  "tps": 85.4,
+  "prefill": 236,
+  "served": "lfm2.5-2.6b"
+ },
+ "evidence": {
+  "ok": {
+   "load": true,
+   "chat": true,
+   "reasoning": true,
+   "tools": true,
+   "context": true,
+   "speed": true
+  },
+  "chat": {
+   "content": "\nred, yellow, blue",
+   "finish": "stop"
+  },
+  "reasoning": {
+   "thinking_chars": 295,
+   "content": "\n391"
+  },
+  "tools": {
+   "call": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Paris\"}"
+     },
+     "id": "iQTa42SNrrD3pqsbJlwNoYxb8Hi3b0qS"
+    }
+   ],
+   "reply": "The current weather in Paris is **17°C** with **overcast** skies.",
+   "finish": "stop",
+   "calls_again": 0,
+   "thinking_chars": 236
+  },
+  "context": {
+   "prompt_tokens": 45462,
+   "seconds": 192.9,
+   "content": "58213"
+  },
+  "speed": {
+   "window_s": 30,
+   "tokens_total": 2013,
+   "seconds_total": 25.7
+  }
+ },
+ "launch_config_sha256": null
+}
