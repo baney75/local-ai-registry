@@ -54,6 +54,28 @@ A host profile runs on the machine itself instead: install its pinned pip packag
 profile's paths, write the launcher, raise `iogpu.wired_limit_mb` to the card's memory less the profile's reserve
 (it resets on reboot), and start the launcher. `lab.py try --on endpoint` tests it where it runs.
 
+### A pinned host runtime
+
+A host profile whose runtime is not on the machine can pin it with an optional `runtime` (never together with `pip`).
+The SDKs render it as steps in place of the free-text `install`, and each step stops at its first failure:
+
+- `archive: {url, sha256, into}`: an `https` `.tar.gz` or `.tgz` (the file name is the URL's last segment, percent-decoded,
+  so `%2B` is `+`), checked with `shasum -a 256 -c` before `tar -xzf` into `into`.
+- `python`: the interpreter, a relative path, usually inside `into`.
+- `packages: {dir, target, wheels: [{name, version, url, sha256}]}` (needs `python`): every wheel is downloaded into `dir`
+  and checked against its hash, then installed offline into `target` with
+  `python -I -m pip install --no-index --find-links dir --only-binary :all: --require-hashes -r dir/requirements.lock.txt`.
+  The lock lists exactly these wheels, so a missing or extra dependency fails the install.
+
+A host weights entry with `layout: "hub"` is a Hugging Face cache: `hf download --cache-dir <at>`, then a check that
+`models--<org>--<name>/snapshots/<revision>` exists, and with `ref` (for example `main`) a task-local `refs/<ref>` file that
+names the revision, so a server that loads the repo id offline finds it.
+
+`lab.py check` rejects hashes that are not 64 hex characters, URLs that are not plain `https` paths, absolute paths or `..`,
+wheel files whose name or version differ from the entry, duplicate wheels, unknown keys and `ref` without `layout: "hub"`,
+and both SDKs refuse to render them. These keys are in a host profile's digest only when present, so profiles without them
+keep their digest, and adding them to a measured profile means rerunning its recipe.
+
 ## Rules CI enforces
 
 - Every recipe is at its path, with weights pinned to a commit and a profile pinned to an image digest (or, for a host profile, the digest of its launch).
