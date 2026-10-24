@@ -25,6 +25,7 @@ import shlex
 import string
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -70,7 +71,10 @@ def pin(p):
     keys = ("command", "install", "pip", "env", "port", "weights", "ctx", "seqs", "vision", "wired_limit_reserve_mb")
     # several cards (or machines) count too, but one is the default and stays out, so every single-card pin is unchanged
     topology = {k: p[k] for k in ("cards", "machines") if p.get(k, 1) != 1}
-    return hashlib.sha256(json.dumps({**{k: p.get(k) for k in keys}, **topology, "config": config_text(p)}, sort_keys=True).encode()).hexdigest()
+    # a pinned host runtime (interpreter archive, hash-locked wheels) is part of what runs; it counts only when present,
+    # so every pin without one is unchanged
+    runtime = {"runtime": p["runtime"]} if "runtime" in p else {}
+    return hashlib.sha256(json.dumps({**{k: p.get(k) for k in keys}, **topology, **runtime, "config": config_text(p)}, sort_keys=True).encode()).hexdigest()
 
 
 def profile_file(name):
@@ -135,6 +139,8 @@ def render(recipe):
             # MLX on Apple silicon: pinned packages, a launcher file, its environment, and a GPU wired-memory limit that
             # follows the card's unified memory
             out.update({k: p[k] for k in ("pip",) if p.get(k)})
+            if "runtime" in p:  # an optional pinned runtime: passed through whole, so lab.py check sees exactly what is pinned
+                out["runtime"] = p["runtime"]
             text = config_text(p)
             if text:
                 out["config"] = {"at": p["config"]["at"], "text": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
@@ -510,6 +516,10 @@ def cmd_try(args):
     recipe = {"model": args.model, "weights": args.weights, "engine": f"{p['id']}@{pin(p)[:12]}",
               "set": sets, "card": args.card}
     launch = render(recipe)
+    try:
+        check_host_runtime(launch)
+    except AssertionError as e:
+        raise SystemExit(f"{p['id']}: {e}")
     if below_kv_floor(recipe, launch):
         raise SystemExit(f"{kv_tokens(recipe, launch)} KV tokens on {setup_vram_gb(recipe, launch):g} GB: a setup over "
                          f"{KV_FLOOR_ABOVE_VRAM_GB} GB needs at least {KV_FLOOR_TOKENS} (raise ctx or seqs)")
@@ -621,6 +631,85 @@ def cmd_render(args):
 NEEDS = {"host_ram_gb": (int, float), "disk_gb": (int, float), "fast_storage": str, "cpus": int}
 
 
+# ----------------------------------------------------------------------------- pinned host runtime
+# An optional host-launch contract that the SDKs render as executable, fail-closed steps (docs/design.md, "A pinned host
+# runtime"): `runtime.archive` {url, sha256, into} is a release archive extracted into a directory; `runtime.python` is the
+# interpreter that installs `runtime.packages` {dir, target, wheels: [{name, version, url, sha256}]} offline and hash-locked
+# into `target`; host weights with `layout: hub` go to a Hugging Face cache at `at`, with an optional task-local `ref`
+# (refs/<ref> -> the pinned revision). Every value is validated here and again in both SDKs before anything is rendered.
+RT_SHA = r"[0-9a-f]{64}"
+RT_REL = r"(?!.*(?:^|/)\.\.?(?:/|$))[A-Za-z0-9_][A-Za-z0-9._+-]*(?:/[A-Za-z0-9_][A-Za-z0-9._+-]*)*"  # relative, no . or .. parts
+RT_URL = r"https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~%+-]+)+"  # no query, fragment, credentials or shell syntax
+RT_ARCHIVE = r"[A-Za-z0-9][A-Za-z0-9._+-]*\.(?:tar\.gz|tgz)"
+RT_WHEEL = r"[A-Za-z0-9][A-Za-z0-9._+-]*\.whl"
+RT_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+RT_VERSION = r"[A-Za-z0-9][A-Za-z0-9.+!_-]*"
+RT_REF = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+RT_REPO = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+
+
+def _canon(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _url_file(url):
+    """The file a URL names: its last path segment, percent-decoded (a CPython release asset's %2B becomes +)."""
+    return urllib.parse.unquote(url.rsplit("/", 1)[1])
+
+
+def check_host_runtime(launch):
+    """Validate the optional pinned host runtime and Hugging Face cache weights of a launch; raise AssertionError."""
+    kind = launch.get("kind")
+    weights = launch.get("weights") or []
+    weights = weights if isinstance(weights, list) else [weights]
+    for w in weights:
+        if "ref" in w:
+            assert kind == "host" and w.get("layout") == "hub", "weights.ref is only for host weights with layout hub"
+            assert isinstance(w["ref"], str) and re.fullmatch(RT_REF, w["ref"]), f"weights.ref {w.get('ref')!r}"
+        if kind == "host" and w.get("layout") == "hub":
+            assert set(w) <= {"repo", "revision", "at", "layout", "files", "ref"}, f"hub weights keys {sorted(w)}"
+            assert re.fullmatch(RT_REPO, w["repo"]) and re.fullmatch(r"[0-9a-f]{40}", w["revision"]), "hub weights repo@revision"
+            assert isinstance(w["at"], str) and re.fullmatch(RT_REL, w["at"]), f"hub weights cache dir {w.get('at')!r}"
+            fs = w.get("files") or []
+            fs = fs if isinstance(fs, list) else [fs]
+            assert all(isinstance(f, str) and re.fullmatch(RT_REL, f) for f in fs), "hub weights files"
+    rt = launch.get("runtime")
+    if rt is None:
+        return
+    assert kind == "host", "runtime is for host launches"
+    assert isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages"}, f"runtime keys {sorted(rt) if isinstance(rt, dict) else rt}"
+    assert not launch.get("pip"), "runtime and pip are exclusive (pip installs globally)"
+    if "archive" in rt:
+        a = rt["archive"]
+        assert isinstance(a, dict) and set(a) == {"url", "sha256", "into"}, "runtime.archive needs exactly url, sha256, into"
+        assert isinstance(a["url"], str) and re.fullmatch(RT_URL, a["url"]), f"runtime.archive.url {a.get('url')!r}"
+        assert re.fullmatch(RT_ARCHIVE, _url_file(a["url"])), f"runtime.archive file {_url_file(a['url'])!r} is not a .tar.gz/.tgz"
+        assert isinstance(a["sha256"], str) and re.fullmatch(RT_SHA, a["sha256"]), "runtime.archive.sha256"
+        assert isinstance(a["into"], str) and re.fullmatch(RT_REL, a["into"]), f"runtime.archive.into {a.get('into')!r}"
+    if "python" in rt:
+        assert isinstance(rt["python"], str) and re.fullmatch(RT_REL, rt["python"]), f"runtime.python {rt.get('python')!r}"
+    if "packages" in rt:
+        pk = rt["packages"]
+        assert "python" in rt, "runtime.packages needs runtime.python"
+        assert isinstance(pk, dict) and set(pk) == {"dir", "target", "wheels"}, "runtime.packages needs exactly dir, target, wheels"
+        for k in ("dir", "target"):
+            assert isinstance(pk[k], str) and re.fullmatch(RT_REL, pk[k]), f"runtime.packages.{k} {pk.get(k)!r}"
+        assert isinstance(pk["wheels"], list) and pk["wheels"], "runtime.packages.wheels is a non-empty list"
+        names, files = set(), set()
+        for w in pk["wheels"]:
+            assert isinstance(w, dict) and set(w) == {"name", "version", "url", "sha256"}, "each wheel needs exactly name, version, url, sha256"
+            assert isinstance(w["name"], str) and re.fullmatch(RT_NAME, w["name"]), f"wheel name {w.get('name')!r}"
+            assert isinstance(w["version"], str) and re.fullmatch(RT_VERSION, w["version"]), f"wheel version {w.get('version')!r}"
+            assert isinstance(w["url"], str) and re.fullmatch(RT_URL, w["url"]), f"wheel url {w.get('url')!r}"
+            assert isinstance(w["sha256"], str) and re.fullmatch(RT_SHA, w["sha256"]), f"wheel sha256 for {w['name']}"
+            f = _url_file(w["url"])
+            assert re.fullmatch(RT_WHEEL, f), f"wheel file {f!r}"
+            dist, ver = (f.split("-") + ["", ""])[:2]
+            assert _canon(dist) == _canon(w["name"]) and ver == w["version"], f"wheel file {f} is not {w['name']} {w['version']}"
+            assert _canon(w["name"]) not in names and f not in files, f"wheel {w['name']} listed twice"
+            names.add(_canon(w["name"])); files.add(f)
+
+
 def check_needs(n):
     """`needs`: what the host must have besides the card, for launches that keep weights in system RAM or read them
     from disk while serving. host_ram_gb = free system RAM the server takes (measured peak), disk_gb = space for the
@@ -650,6 +739,7 @@ def cmd_check(_):
             assert f.parent.name == r["card"] and f.parent.parent.name == c["vendor"], "path is not recipes/<vendor>/<card>/"
             launch = render(r)
             assert f == recipe_path(r, launch), f"file name should be {recipe_path(r, launch).name}"
+            check_host_runtime(launch)
             if launch.get("kind") == "host":  # the SDK's host steps start one program on one machine
                 assert type(launch["cards"]) is int and launch["cards"] >= 1, "host cards must be a whole number of cards"
                 assert launch.get("machines", 1) == 1, "multi-machine host launches are not supported by the current SDK; use a container launch"
