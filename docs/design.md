@@ -60,12 +60,17 @@ A host profile whose runtime is not on the machine can pin it with an optional `
 The SDKs render it as steps in place of the free-text `install`. Each setup step is one `( set -e ... )` subshell, so it
 stops at its first failure and exits non-zero, and the one-script `command()` of such a launch starts with `set -e`, so a
 failed step stops every later step and the server, however the script is run. Nothing is written through a symlink: each
-step first refuses a symlink at its destination or at any directory above it.
+step first refuses a symlink at its destination or at any directory above it, and checks again right before it renames
+into place. A file (`refs/<ref>`, the launcher) is written to an exclusive `mktemp` file in its checked directory and
+renamed over the destination only if that is neither a link nor a directory.
 
 - `archive: {url, sha256, into}`: an `https` `.tar.gz` or `.tgz` (the file name is the URL's last segment, percent-decoded,
-  so `%2B` is `+`). It is downloaded into a fresh directory inside `into`, checked with `shasum -a 256 -c`, extracted there,
-  and only then each of its top-level entries replaces the one in `into` by rename. Other files in `into` (packages,
-  weights, the launcher) are kept; a failure leaves the previous runtime as it was.
+  so `%2B` is `+`). It is downloaded into a fresh directory inside `into`, checked with `shasum -a 256 -c` and extracted
+  there. Before anything live is touched, every top-level entry must have a plain name, must not be a link in `into`, and
+  must not hold another step's destination, and the staged interpreter must run. Only then does each entry replace the
+  one in `into` by rename. If a rename fails, every entry already moved is put back, so the previous runtime stays whole
+  and usable; if putting it back fails too, the previous copy is kept (not deleted) and the step says where. Other files in
+  `into` (packages, weights, the launcher) are kept.
 - `python`: the interpreter, a relative path inside `into`, run as `./<python>`, never looked up on `PATH`.
 - `packages: {dir, target, wheels: [{name, version, url, sha256}]}` (needs `python`; `dir` and `target` do not overlap):
   every wheel is downloaded into a fresh directory beside `dir` and checked against its hash, then installed offline into a
@@ -73,7 +78,7 @@ step first refuses a symlink at its destination or at any directory above it.
   `./<python> -I -m pip --isolated install --no-index --find-links <wheels> --only-binary :all: --require-hashes -r requirements.lock.txt --target <fresh>`.
   The lock lists exactly these wheels, so a missing or extra dependency fails the install. Only after the install succeeds
   do the fresh directories replace `target` and `dir` by rename, so `target` holds exactly the pinned wheels (nothing left
-  from an earlier install) and a failure leaves the previous `target` and `dir` as they were.
+  from an earlier install); a failure, including a failed rename, leaves the previous `target` and `dir` as they were.
 
 A host weights entry with `layout: "hub"` is a Hugging Face cache at `at`; one launch's host weights are all hub or all
 directories. With a pinned runtime, `runtime.packages` must include `huggingface_hub`, and the download runs on the pinned
@@ -84,8 +89,10 @@ offline finds it.
 
 `lab.py check` rejects hashes that are not 64 hex characters, URLs that are not plain `https` paths, absolute paths or `..`,
 an interpreter outside the archive, wheel files whose name or version differ from the entry, duplicate wheels, unknown
-keys, `ref` without `layout: "hub"`, and runtime weights without hub layout or a pinned `huggingface_hub`, and both SDKs
-refuse to render them. These keys are in a host profile's digest only when present, so profiles without them keep their
+keys, `ref` without `layout: "hub"`, runtime weights without hub layout or a pinned `huggingface_hub`, and destinations
+that collide: `packages.target`, `packages.dir`, each hub cache (weights may share one) and the launcher never equal or
+contain one another, none is or contains `into`, and none lies in the archive entry that holds the interpreter. Both SDKs
+refuse to render any of them. These keys are in a host profile's digest only when present, so profiles without them keep their
 digest, and adding them to a measured profile means rerunning its recipe.
 
 ## Rules CI enforces
