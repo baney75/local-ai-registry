@@ -17,7 +17,9 @@ The card has more than 8 GB, so the registry's KV floor applies. The launch hold
 
 ## Every response ended naturally
 
-The lab records `finish_reason` only for the chat answer and the tool follow-up. The lab was therefore pointed at a pass-through recorder on 127.0.0.1:15001, which forwarded each request unchanged to the server on 127.0.0.1:15000 and logged every response's finish reason. This recorder is a task tool, not part of the lab or the kit. Its log is [finish-recorder.jsonl](../../lab-runs/20261024-rtx-4080-laptop-12gb.finish-recorder.jsonl), and the checked postconditions are in [postconditions.json](../../lab-runs/20261024-rtx-4080-laptop-12gb.postconditions.json).
+The lab records `finish_reason` only for the chat answer and the tool follow-up. The lab was therefore pointed at a pass-through recorder on 127.0.0.1:15001, which forwarded each request unchanged to the server on 127.0.0.1:15000 and logged every response's finish reason. This recorder is a task tool, not part of the lab or the kit; it is published here as [finish_recorder.py](finish_recorder.py), and the checks as [check_postconditions.py](check_postconditions.py). Its log is [finish-recorder.jsonl](../../lab-runs/20261024-rtx-4080-laptop-12gb.finish-recorder.jsonl), and the checked postconditions are in [postconditions.json](../../lab-runs/20261024-rtx-4080-laptop-12gb.postconditions.json).
+
+Every raw request body, every raw JSON response and the full SSE text of both streams are in [raw-recorder.tar.gz](../../lab-runs/20261024-rtx-4080-laptop-12gb.raw-recorder.tar.gz): 44 body files, `recorder.jsonl` and a `SHA256SUMS` list. Archive SHA256 d1e6f9da5e2e7802c931876256837e53e590bdad500e6e8a34c5b397f44b0e0c ([.sha256](../../lab-runs/20261024-rtx-4080-laptop-12gb.raw-recorder.tar.gz.sha256)). Verify with `sha256sum -c 20261024-rtx-4080-laptop-12gb.raw-recorder.tar.gz.sha256`, then `tar xzf … && sha256sum -c SHA256SUMS`. Its `recorder.jsonl` is byte-identical to the log above.
 
 - The run made exactly seven `POST /v1/chat/completions` requests: the six gate requests plus the repeat. Every one returned HTTP 200 with no error.
 - None of the requests set `max_tokens` or `max_completion_tokens`.
@@ -42,49 +44,23 @@ The lab records `finish_reason` only for the chat answer and the tool follow-up.
 
 ## Reproduction on a Linux host without the NVIDIA Container Toolkit
 
-Use Python 3.11 or newer for the registry checks. Driver library names follow the installed driver version; adjust `DRIVER` and `LIBDIR` to match yours.
+[repro.sh](repro.sh) is a self-contained, bounded reproduction of the whole measured procedure. It needs Linux, an NVIDIA driver, rootless Podman, `flock`, `curl` and Python 3.11 or newer, and it changes no GPU, driver, clock, power or OS setting.
 
 ~~~bash
-MODEL_DIR=/path/to/Qwen3.5-9B-EXL3-6hb-4bpw       # TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef
-IMAGE=ghcr.io/0xsero/tabbyapi-exl3@sha256:0f83e6198dc3be2561652d8df2525a7d1a69733e12fc8e25cbc5bc319a8a3ad1
-LIBDIR=/usr/lib DRIVER=610.57.04
-STORE=$(mktemp -d /path/to/roomy-disk/sybil-4080l.XXXXXX) || exit 1
-mkdir -p "$STORE/tmp" || exit 1
-export TMPDIR="$STORE/tmp"
-P=(podman --root "$STORE/root" --runroot "$STORE/run" --tmpdir "$STORE/tmp")
-echo "c43536c08cb54147a097937868f0791f637f98d1505c79475aa9b9b05589a74b  $MODEL_DIR/model.safetensors" | sha256sum -c - || exit 1
-python3 lab/lab.py render registry/recipes/nvidia/rtx-4080-laptop-12gb/qwen3.5-9b.tabbyapi.128k.json \
-  | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["config"]["text"])' > "$STORE/config.yml" || exit 1
-echo "d3efe710e28fe94a93a81a86bf52f74f95ab6740800890d78b6a4f9db7ee9d0c  $STORE/config.yml" | sha256sum -c - || exit 1
-LIBS=()
-for l in libcuda.so.1 libcuda.so libnvidia-ml.so.1 libnvidia-ptxjitcompiler.so.1 libnvidia-nvvm.so.4 libnvidia-gpucomp.so.$DRIVER; do
-  f=$(readlink -f "$LIBDIR/$l"); [ -f "$f" ] || { echo "missing $l" >&2; exit 1; }
-  LIBS+=(-v "$f:/usr/local/nvidia/lib64/$l:ro")
-done
-cleanup() {
-  if [ -s "$STORE/container.cid" ]; then
-    timeout 60 "${P[@]}" logs "$(cat "$STORE/container.cid")" > "$STORE/server.log" 2>&1 || true
-    timeout 60 "${P[@]}" rm -f "$(cat "$STORE/container.cid")" >/dev/null || true
-  fi
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-timeout 3000 "${P[@]}" pull "$IMAGE" || exit 1
-timeout 120 "${P[@]}" run -d --cidfile "$STORE/container.cid" \
-  --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools "${LIBS[@]}" \
-  -e NVIDIA_VISIBLE_DEVICES=all --shm-size 8g -p 127.0.0.1:15000:5000 \
-  -v "$MODEL_DIR":/workspace/models/Qwen3.5-9B-EXL3-6hb-4bpw:ro -v "$STORE/config.yml":/app/config.yml:ro \
-  --entrypoint /opt/venv/bin/python3 "$IMAGE" main.py --config /app/config.yml || exit 1
-READY=no
-for i in $(seq 1 180); do
-  timeout 5 curl --max-time 4 -sf http://127.0.0.1:15000/v1/models >/dev/null && { READY=yes; break; }
-  sleep 5
-done
-[ "$READY" = yes ] || { echo 'server did not become healthy' >&2; exit 1; }
-timeout 5400 python3 lab/lab.py try TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef \
-  --model qwen3.5-9b --engine tabbyapi-qwen3.5-9b-exl3-4bpw-128k --card rtx-4080-laptop-12gb \
-  --on endpoint --endpoint http://127.0.0.1:15000 --gpu 'NVIDIA GeForce RTX 4080 Laptop GPU' || exit 1
+MODEL_DIR=/path/to/Qwen3.5-9B-EXL3-6hb-4bpw STORE=/path/to/roomy/dir \
+  bash data/sources/rtx4080-laptop-tabbyapi-exl3-container/repro.sh
 ~~~
 
-The example uses the measured image, weights, frozen config and the host GPU mapping. Its bounded lifecycle and isolated storage are reproduction helpers. It saves the server log before removing the container. The measured run also sent the lab's requests through the recorder described above, and the run required all seven chat completions to finish with `stop` (or `tool_calls` for the tool call) before it counted as qualified.
+What it does, in order:
+
+1. Pins. It refuses to run unless `lab/lab.py` is the stock lab (SHA256 b7d36ea4…5cca), the recipe renders to the measured launch (72198e58…7097) and config file (d3efe710…9d0c), all 13 weight files match [weights.manifest](weights.manifest), the image has the pinned digest, and the GPU is an idle `NVIDIA GeForce RTX 4080 Laptop GPU` with no other compute process. It takes one non-blocking lock per `STORE`, so only one run can use a store at a time.
+2. Server. It starts the rendered launch with the device and driver-library mapping described above. The container gets a per-run name, cidfile and `sybil.run` label.
+3. Lab. It runs the stock `lab.py try --on endpoint` through the recorder, then one uncapped repeat of the stock speed request using the lab's own `stream_rate`.
+4. Postconditions. [check_postconditions.py](check_postconditions.py) requires exactly seven chat completions, each HTTP 200 with no error and no `max_tokens` / `max_completion_tokens`, with `stop` (or `tool_calls` with calls) on every JSON answer and a final `stop` on both streams. It also requires the repeat to reach at least 15 tok/s.
+5. Cleanup, always. It acts only on a container whose id and run label it verifies. It saves the server log and requires it to be non-empty, then removes the container (escalating from `rm` to `kill` and `rm`) and requires podman to report the container gone. It stops only the helper process it started, after checking that helper's PID and start time.
+
+It exits 0 only if the six gates, the repeat and every postcondition pass, the server log was saved and the container and helper are positively gone. The exit codes are listed at the top of the script. Every stage is bounded (`REPRO_TIMEOUT` 7200 s overall, `HEALTH_TIMEOUT` 900, `LAB_TIMEOUT` 5400, `REPEAT_TIMEOUT` 1800), and cleanup also runs after a timeout or signal. Each run writes its evidence to `STORE/run-<id>/`: the lab log and run JSON, `recorder.jsonl` with raw bodies, `postconditions.json`, `server.log` and the cleanup readback.
+
+[test_repro.py](test_repro.py) runs `repro.sh` on CPU against a stub Podman and `nvidia-smi` and a fake TabbyAPI, with the real stock lab. It checks that a correct run exits 0, and that a run fails when an answer has the right text but ends with `length` (reasoning, tool call, context, speed or repeat). The stock lab passes that last case on its own. It also checks failure on a log that fails or is empty, a container that cannot be removed, a container with another run's label (left untouched), a busy or different GPU, a missing driver library, mismatched weights, a held lock, and a server that never becomes healthy, hangs, or fails to start. A container `rm` that fails once must be escalated and still end clean.
+
+The measured run above came from the task runner that `repro.sh` was built from: the same recorder, checks, mapping and launch. `repro.sh` itself has passed only its CPU fixtures so far.

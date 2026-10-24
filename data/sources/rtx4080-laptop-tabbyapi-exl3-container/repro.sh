@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# Reproduce the RTX 4080 Laptop GPU proof of qwen3.5-9b.tabbyapi.128k: the frozen
+# tabbyapi-qwen3.5-9b-exl3-4bpw-128k launch in rootless Podman, the unchanged stock lab through a
+# pass-through finish-reason recorder, one uncapped repeat of the stock speed request, and a check that
+# all seven chat completions ended naturally. Linux, NVIDIA driver, rootless Podman, flock, Python 3.11+.
+# It changes no GPU, driver, clock, power or OS setting and never touches a process or container it did
+# not start.
+#
+#   MODEL_DIR=/path/to/Qwen3.5-9B-EXL3-6hb-4bpw STORE=/path/to/roomy/dir \
+#     bash data/sources/rtx4080-laptop-tabbyapi-exl3-container/repro.sh
+#
+# MODEL_DIR holds TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef (13 files, checked
+# against weights.manifest). STORE gets the Podman storage, the run lock and one run-<id>/ directory per
+# run. Optional: LIBDIR (host driver libraries, default /usr/lib), SERVER_PORT (15000), REC_PORT (15001),
+# PYTHON (python3), and the bounds REPRO_TIMEOUT (7200 s), HEALTH_TIMEOUT (900), LAB_TIMEOUT (5400),
+# REPEAT_TIMEOUT (1800).
+#
+# Exit 0 only if the six lab gates, the repeat (>= 15 tok/s) and every postcondition pass AND the server
+# log was saved non-empty AND this run's container is positively gone AND its helper processes are gone.
+# 1 a lab gate failed; 3 the GPU is busy or is not the measured card; 4 an input check failed; 5 the
+# container did not start or is not verifiably this run's; 6 never healthy; 7 another run holds the
+# lock; 8 lab passed but the repeat or a postcondition failed; 9 log saving or cleanup failed;
+# 124/143 the overall bound or a signal ended the run (cleanup still ran).
+set -uo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
+: "${REPRO_TIMEOUT:=7200}" "${HEALTH_TIMEOUT:=900}" "${LAB_TIMEOUT:=5400}" "${REPEAT_TIMEOUT:=1800}"
+if [ -z "${SYBIL_REPRO_BOUNDED:-}" ]; then  # the whole run, cleanup included, under one bound
+  export SYBIL_REPRO_BOUNDED=1
+  exec timeout -k 300 "$REPRO_TIMEOUT" bash "$0" "$@"
+fi
+
+# Pins (the frozen launch, the stock lab, the measured card)
+IMAGE=ghcr.io/0xsero/tabbyapi-exl3@sha256:0f83e6198dc3be2561652d8df2525a7d1a69733e12fc8e25cbc5bc319a8a3ad1
+WEIGHTS=TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef
+RECIPE=registry/recipes/nvidia/rtx-4080-laptop-12gb/qwen3.5-9b.tabbyapi.128k.json
+LAUNCH_SHA=72198e58f86afcf47cd0b7aae9d2c23dfc5f2af25440b260e2bca6a816e07097
+CONFIG_SHA=d3efe710e28fe94a93a81a86bf52f74f95ab6740800890d78b6a4f9db7ee9d0c
+LAB_SHA=b7d36ea47989bd9d5283d2d5799851827480aba53b11aacc9fe10dd403245cca
+GPU_NAME='NVIDIA GeForce RTX 4080 Laptop GPU'
+: "${MODEL_DIR:?set MODEL_DIR}" "${STORE:?set STORE}"
+: "${LIBDIR:=/usr/lib}" "${SERVER_PORT:=15000}" "${REC_PORT:=15001}" "${PYTHON:=python3}"
+
+mkdir -p "$STORE/tmp" || exit 4
+STORE=$(cd "$STORE" && pwd)
+export TMPDIR=$STORE/tmp
+P=(podman --root "$STORE/root" --runroot "$STORE/run" --tmpdir "$STORE/tmp")
+RUNID=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+RUN=$STORE/run-$RUNID
+mkdir "$RUN" || { echo "cannot create a fresh $RUN" >&2; exit 4; }
+trap '' PIPE  # a closed log pipe must not kill cleanup
+exec > >(trap '' INT TERM; exec tee -a "$RUN/repro.log") 2>&1  # the logger outlives a TERM so cleanup is logged
+stamp() { echo "[$(date -u +%FT%TZ)] $*"; }
+stamp "run $RUNID in $RUN"
+
+RC=0; CREATED=0; CLEANED=0; REC=; REC_T=
+
+# Start time of a process (field 22 of /proc/<pid>/stat, read after the command name); fails if it is
+# gone or a zombie. Used to signal only processes this run started.
+proc_start() {
+  local s
+  s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  s=${s##*) }
+  set -- $s
+  case "$1" in Z|X|x) return 1 ;; esac
+  echo "${20}"
+}
+fenced_kill() {
+  local pid=$1 want=$2 got i
+  [ -n "$pid" ] && [ -n "$want" ] || return 0
+  got=$(proc_start "$pid") || return 0
+  [ "$got" = "$want" ] || { echo "fence: pid $pid is no longer this run's helper; not signalled"; return 0; }
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 50); do
+    [ "$(proc_start "$pid")" = "$want" ] || return 0
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null; sleep 0.5
+  [ "$(proc_start "$pid")" = "$want" ] && { echo "fence: helper $pid survived KILL"; return 1; }
+  return 0
+}
+
+# A container id is this run's only if podman reports exactly that id with this run's unique label.
+is_owned() {
+  local got
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]] || return 1
+  got=$(timeout -k 5 30 "${P[@]}" inspect --format '{{.Id}} {{index .Config.Labels "sybil.run"}}' "$1" 2>/dev/null) || return 1
+  [ "$got" = "$1 $RUNID" ]
+}
+# Positively gone: `container exists` answers "no" (exit 1, not an error) and no container carries the label.
+gone() {
+  local rc left
+  timeout -k 5 30 "${P[@]}" container exists "$1"; rc=$?
+  [ "$rc" -eq 1 ] || return 1
+  left=$(timeout -k 5 30 "${P[@]}" ps -a -q --filter "label=sybil.run=$RUNID") || return 1
+  [ -z "$left" ]
+}
+save_logs() {  # $1 = owned id; success means podman exited 0 and the log is not empty
+  timeout -k 5 60 "${P[@]}" logs --timestamps "$1" > "$RUN/server.log" 2>&1 && [ -s "$RUN/server.log" ] \
+    || { stamp "server log NOT saved (or empty) for ${1:0:12}"; return 1; }
+  timeout -k 5 30 "${P[@]}" inspect "$1" > "$RUN/container-inspect.json" 2>&1
+  stamp "server log saved: $(wc -l < "$RUN/server.log") lines"
+}
+remove_owned() {  # always attempts removal of an owned id; escalates rm -> kill -> rm; requires positive absence
+  local cid=$1
+  timeout -k 5 60 "${P[@]}" rm -f -t 20 "$cid" > /dev/null 2>&1
+  gone "$cid" && return 0
+  stamp "rm did not remove ${cid:0:12}; escalating"
+  timeout -k 5 30 "${P[@]}" kill "$cid" > /dev/null 2>&1
+  timeout -k 5 60 "${P[@]}" rm -f -t 0 "$cid" > /dev/null 2>&1
+  gone "$cid"
+}
+
+cleanup() {
+  [ "$CLEANED" = 1 ] && return
+  CLEANED=1
+  local ok=1 cid left ids=()
+  stamp "cleanup"
+  if [ "$CREATED" = 1 ]; then
+    [ -s "$RUN/container.cid" ] && ids+=("$(cat "$RUN/container.cid")")
+    # a create that never wrote its cidfile still carries this run's unique label
+    for cid in $(timeout -k 5 30 "${P[@]}" ps -a -q --no-trunc --filter "label=sybil.run=$RUNID" 2>/dev/null); do
+      [[ " ${ids[*]} " == *" $cid "* ]] || ids+=("$cid")
+    done
+    for cid in "${ids[@]}"; do
+      if ! is_owned "$cid"; then
+        if gone "$cid"; then continue; fi
+        stamp "container ${cid:0:12} is not verifiably this run's: left untouched"; ok=0; continue
+      fi
+      save_logs "$cid" || ok=0
+      if remove_owned "$cid"; then stamp "container ${cid:0:12} removed (positively gone)"; else stamp "container ${cid:0:12} NOT removed"; ok=0; fi
+    done
+    left=$(timeout -k 5 30 "${P[@]}" ps -a -q --filter "label=sybil.run=$RUNID" 2>&1) && [ -z "$left" ] \
+      || { stamp "a container with this run's label remains (or podman ps failed): $left"; ok=0; }
+  fi
+  fenced_kill "$REC" "$REC_T" || ok=0
+  [ -n "$REC" ] && [ "$(proc_start "$REC")" = "$REC_T" ] && { stamp "recorder still running"; ok=0; }
+  { date -u +%FT%TZ; nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader; } > "$RUN/cleanup-readback.txt" 2>&1
+  echo "$ok" > "$RUN/cleanup.ok"
+  if [ "$RC" -eq 0 ] && [ "$ok" != 1 ]; then RC=9; fi
+  stamp "exit $RC"
+}
+trap 'S=$?; [ "$RC" -eq 0 ] && RC=$S; cleanup; exit $RC' EXIT  # an unexpected exit keeps its status
+trap 'RC=130; exit 130' INT
+trap 'RC=143; exit 143' TERM
+fail() { RC=$1; shift; stamp "$*"; exit "$RC"; }
+
+# 0. One run per STORE (fd 9 is closed for every child so no helper or container keeps the lock)
+exec 9> "$STORE/repro.lock"
+flock -n 9 || fail 7 "another run holds $STORE/repro.lock"
+
+# 1. Inputs
+"$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || fail 4 "Python 3.11 or newer is required"
+[ "$(sha256sum "$ROOT/lab/lab.py" | cut -d' ' -f1)" = "$LAB_SHA" ] || fail 4 "lab/lab.py is not the stock lab"
+(cd "$ROOT" && "$PYTHON" -I -c '
+import json, sys
+sys.path.insert(0, "lab"); import lab
+L = lab.render(json.load(open(sys.argv[1])))
+json.dump(L, open(sys.argv[2], "w"), indent=1, sort_keys=True)
+open(sys.argv[3], "w").write(L["config"]["text"])
+print(lab.launch_hash(L))' "$RECIPE" "$RUN/launch.json" "$RUN/config.yml" > "$RUN/launch.sha256") 9>&- || fail 4 "cannot render $RECIPE"
+[ "$(cat "$RUN/launch.sha256")" = "$LAUNCH_SHA" ] || fail 4 "rendered launch $(cat "$RUN/launch.sha256") is not the measured one"
+[ "$(sha256sum "$RUN/config.yml" | cut -d' ' -f1)" = "$CONFIG_SHA" ] || fail 4 "config file is not the measured one"
+timeout -k 10 900 "$PYTHON" -I "$HERE/verify_weights.py" "$HERE/weights.manifest" "$MODEL_DIR" > "$RUN/weights-verify.txt" 9>&- \
+  || { cat "$RUN/weights-verify.txt"; fail 4 "weights do not match weights.manifest"; }
+for d in /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools; do [ -c "$d" ] || fail 4 "missing $d"; done
+NAME_SEEN=$(timeout -k 5 30 nvidia-smi --query-gpu=name --format=csv,noheader 9>&-) || fail 3 "nvidia-smi failed"
+[ "$NAME_SEEN" = "$GPU_NAME" ] || fail 3 "GPU is '$NAME_SEEN', not the measured '$GPU_NAME'"
+DRIVER=$(timeout -k 5 30 nvidia-smi --query-gpu=driver_version --format=csv,noheader 9>&-) || fail 3 "nvidia-smi failed"
+APPS=$(timeout -k 5 30 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 9>&-) || fail 3 "nvidia-smi failed"
+[ -z "$APPS" ] || fail 3 "GPU is in use by another process: $APPS"
+LIBS=()
+for l in libcuda.so.1 libcuda.so libnvidia-ml.so.1 libnvidia-ptxjitcompiler.so.1 libnvidia-nvvm.so.4 "libnvidia-gpucomp.so.$DRIVER"; do
+  f=$(readlink -f "$LIBDIR/$l" 2>/dev/null) && [ -f "$f" ] || fail 4 "host driver library $LIBDIR/$l does not resolve to a file"
+  echo "$l -> $f $(sha256sum "$f" | cut -d' ' -f1)" >> "$RUN/driver-libs.txt"
+  LIBS+=(-v "$f:/usr/local/nvidia/lib64/$l:ro")
+done
+for port in "$SERVER_PORT" "$REC_PORT"; do
+  "$PYTHON" -c 'import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) else 1)' "$port" \
+    || fail 4 "port $port is in use"
+done
+if ! timeout -k 5 60 "${P[@]}" image exists "$IMAGE" 9>&-; then
+  stamp "pulling $IMAGE"
+  timeout -k 10 3000 "${P[@]}" pull "$IMAGE" 9>&- || fail 4 "pull failed"
+fi
+[ "$(timeout -k 5 60 "${P[@]}" image inspect "$IMAGE" --format '{{.Digest}}' 9>&-)" = "sha256:${IMAGE##*@sha256:}" ] || fail 4 "image digest mismatch"
+{ date -u +%FT%TZ; free -b; nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,driver_version --format=csv; } > "$RUN/baseline.txt" 2>&1 9>&-
+
+# 2. Recorder in front of the server: forwards unchanged, logs every finish reason and raw body
+"$PYTHON" -I "$HERE/finish_recorder.py" "$REC_PORT" "$SERVER_PORT" "$RUN/recorder" 9>&- & REC=$!; REC_T=$(proc_start $REC)
+[ -n "$REC_T" ] || fail 4 "recorder did not start"
+
+# 3. Server: the rendered launch's image, entrypoint, args, env, shm, weights mount and config file; the
+# GPU through its device nodes and the host driver's libraries (read-only), as measured
+stamp "starting container"
+CREATED=1
+timeout -k 10 120 "${P[@]}" run -d --name "sybil-repro-$RUNID" --cidfile "$RUN/container.cid" --label "sybil.run=$RUNID" \
+  --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools "${LIBS[@]}" \
+  -e NVIDIA_VISIBLE_DEVICES=all --shm-size 8g -p "127.0.0.1:$SERVER_PORT:5000" \
+  -v "$MODEL_DIR:/workspace/models/Qwen3.5-9B-EXL3-6hb-4bpw:ro" -v "$RUN/config.yml:/app/config.yml:ro" \
+  --entrypoint /opt/venv/bin/python3 "$IMAGE" main.py --config /app/config.yml > /dev/null 9>&- || fail 5 "podman run failed"
+CID=$(cat "$RUN/container.cid" 2>/dev/null)
+is_owned "$CID" || fail 5 "the started container is not verifiably this run's"
+stamp "container $CID"
+
+DEADLINE=$((SECONDS + HEALTH_TIMEOUT)); READY=no
+while [ $SECONDS -lt $DEADLINE ]; do
+  if timeout -k 2 5 curl --max-time 4 -sf "http://127.0.0.1:$SERVER_PORT/v1/models" > "$RUN/models.json"; then READY=yes; break; fi
+  [ "$(timeout -k 5 30 "${P[@]}" inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)" = true ] || { stamp "server exited during load"; break; }
+  sleep 5
+done
+[ "$READY" = yes ] || fail 6 "server not healthy within ${HEALTH_TIMEOUT}s"
+stamp "healthy"
+
+# 4. The stock lab, unchanged, through the recorder
+cd "$ROOT"
+stamp "lab try"
+timeout -k 30 "$LAB_TIMEOUT" "$PYTHON" lab/lab.py try "$WEIGHTS" --model qwen3.5-9b --engine tabbyapi-qwen3.5-9b-exl3-4bpw-128k \
+  --card rtx-4080-laptop-12gb --on endpoint --endpoint "http://127.0.0.1:$REC_PORT" --gpu "$GPU_NAME" 9>&- 2>&1 | tee "$RUN/lab-try.log"
+LAB=${PIPESTATUS[0]}
+echo "$LAB" > "$RUN/lab.exit"
+stamp "lab exit $LAB"
+find lab/runs -maxdepth 1 -name 'rtx-4080-laptop-12gb.*' -newer "$RUN/config.yml" -exec cp -p {} "$RUN/" \;
+
+# 5. One independent repeat of the stock speed request with the lab's own stream_rate, uncapped
+if [ "$LAB" -eq 0 ]; then
+  timeout -k 30 "$REPEAT_TIMEOUT" "$PYTHON" -c '
+import json, sys, time
+sys.path.insert(0, "lab"); import lab
+ep = sys.argv[1]
+served = lab.call(ep, "/v1/models", timeout=30)[0]["data"][0]["id"]
+t = time.time()
+tps, total, secs = lab.stream_rate(ep, served, "Write a detailed 600-word story about a lighthouse keeper.")
+print(json.dumps({"at": t, "served": served, "tps": round(tps, 1), "tokens_total": total, "seconds_total": round(secs, 1), "min_tps": lab.MIN_TPS, "pass": tps >= lab.MIN_TPS}))
+' "http://127.0.0.1:$REC_PORT" > "$RUN/speed-repeat.json" 2> "$RUN/speed-repeat.err" 9>&-
+  echo $? > "$RUN/repeat.exit"
+  stamp "repeat exit $(cat "$RUN/repeat.exit"): $(cat "$RUN/speed-repeat.json")"
+fi
+
+# 6. Postconditions: exactly 7 chat completions, HTTP 200, no caps, every one ended naturally
+fenced_kill "$REC" "$REC_T"
+"$PYTHON" -I "$HERE/check_postconditions.py" "$RUN" > "$RUN/postconditions.out" 2>&1; PC=$?
+stamp "postconditions exit $PC"
+[ "$LAB" -eq 0 ] || fail 1 "a lab gate failed"
+[ "$PC" -eq 0 ] || fail 8 "the repeat or a postcondition failed: $(grep -A3 failures "$RUN/postconditions.out" | tr -s ' \n' ' ')"
+stamp "all gates, the repeat and every postcondition passed"
+exit 0
