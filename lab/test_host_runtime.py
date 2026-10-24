@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tarfile
 import shutil
 import subprocess
 import sys
@@ -381,25 +382,46 @@ def make_wheel(d, name, version, requires=(), module='VERSION = 1\n'):
 
 
 # The pinned huggingface_hub stand-in: makes the snapshot (unless FAKE_HF_MISS) and records which copy ran.
-HUB = '''import os
-def snapshot_download(repo_id, revision=None, cache_dir=None, allow_patterns=None):
+HUB = '''import json, os
+ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HOME", "HF_XET_CACHE", "HF_ENDPOINT", "HF_TOKEN_PATH", "HOME", "NETRC")
+def snapshot_download(repo_id, revision=None, cache_dir=None, allow_patterns=None, token=None):
     open("HUB_USED", "w").write(os.path.abspath(__file__))
+    json.dump({"token": token, "cache_dir": os.path.abspath(cache_dir), **{k: os.environ.get(k) for k in ENV}}, open("HUB_ENV", "w"))
     if os.environ.get("FAKE_HF_MISS"):
         return cache_dir
+    # the real layout: a blob, a snapshot file linking to it, and a lock under the cache root
     m = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"))
     snap = os.path.join(m, "snapshots", revision)
+    blob = os.path.join(m, "blobs", "0f1e2d")
+    os.makedirs(os.path.dirname(blob), exist_ok=True)
+    open(blob, "w").write("{}")
     os.makedirs(snap, exist_ok=True)
-    open(os.path.join(snap, "config.json"), "w").write("{}")
-    # a hostile cache, changed while the download ran: refs a link out, refs/main a link out, or refs/main a directory
+    os.symlink(os.path.relpath(blob, snap), os.path.join(snap, "config.json"))
+    os.makedirs(os.path.join(cache_dir, ".locks", os.path.basename(m)), exist_ok=True)
+    # a hostile cache, changed while the download ran
     hostile, out = os.environ.get("FAKE_HF_HOSTILE"), os.environ.get("FAKE_OUTSIDE")
-    if hostile == "refs":
+    if hostile == "refs":  # refs a link out
         os.symlink(out, os.path.join(m, "refs"))
-    elif hostile == "ref":
+    elif hostile == "ref":  # refs/main a link out
         os.makedirs(os.path.join(m, "refs"), exist_ok=True)
         os.symlink(os.path.join(out, "victim"), os.path.join(m, "refs", "main"))
-    elif hostile == "refdir":
+    elif hostile == "refdir":  # refs/main a directory
         os.makedirs(os.path.join(m, "refs", "main"), exist_ok=True)
+    elif hostile == "escape":  # a snapshot file that is an absolute link out
+        os.symlink(os.path.join(out, "victim"), os.path.join(snap, "model.safetensors"))
+    elif hostile == "climb":  # a snapshot file that climbs out
+        os.symlink(os.path.relpath(os.path.join(out, "victim"), snap), os.path.join(snap, "model.safetensors"))
+    elif hostile == "fifo":
+        os.mkfifo(os.path.join(snap, "pipe"))
     return snap
+'''
+# An ambient hf for a launch without a runtime: records what it sees and lays out the cache like the real one.
+FAKE_HF = '''#!/bin/sh
+repo=$2; rev=; dir=
+while [ $# -gt 0 ]; do case "$1" in --revision) rev=$2; shift 2;; --cache-dir) dir=$2; shift 2;; *) shift;; esac; done
+env > HF_ENV
+m="$dir/models--$(printf '%s' "$repo" | sed 's#/#--#')"
+mkdir -p "$m/blobs" "$m/snapshots/$rev" && echo '{}' > "$m/blobs/0f1e2d" && ln -s ../../blobs/0f1e2d "$m/snapshots/$rev/config.json"
 '''
 FAKE_CURL = '''#!/bin/sh
 # curl -fL -o FILE URL: copy the URL's file from $FAKE_SERVER, or fail like curl -f on a 404
@@ -607,8 +629,6 @@ class SandboxTest(unittest.TestCase):
             'packages parent': (self.L(root='opt/rt'), [], link('opt'), 'Install the packages'),
             'cache leaf': (self.L(), ['Install the runtime', 'Install the packages'], link('rt/hf-cache'), 'Download the weights'),
             'model dir': (self.L(), ['Install the runtime', 'Install the packages'], link(m), 'Download the weights'),
-            'refs dir': (self.L(), ['Install the runtime', 'Install the packages'], link(m + '/refs'), 'Download the weights'),
-            'ref leaf': (self.L(), ['Install the runtime', 'Install the packages'], link(m + '/refs/main', self.outside / 'victim'), 'Download the weights'),
             'cache parent': (self.L(root='opt/rt'), [], link('opt'), 'Download the weights'),
             'launcher leaf': (self.L(), [], link('launcher/serve.py', self.outside / 'victim'), 'Write the launcher'),
             'launcher parent': (self.L(), [], link('launcher'), 'Write the launcher'),
@@ -633,30 +653,151 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((w / 'rt/hf-cache/models--org--model/refs/main').read_text(), REV)
 
-    # r2: the ref is written through an exclusive temp file; links and directories at refs paths are refused
+    # r2/r3: the download goes into a fresh staging cache; links planted in the old cache are never followed, the staged
+    # cache must hold only links that stay inside it, and the ref is written through an exclusive temp file
 
-    def test_planted_fixed_temp_link_is_never_written(self):
-        m = 'rt/hf-cache/models--org--model/refs'
+    def test_planted_links_in_the_cache_are_never_followed(self):
+        m = 'rt/hf-cache/models--org--model'
+        plants = {f'{m}/blobs': self.outside, f'{m}/refs': self.outside, f'{m}/snapshots/{REV}': self.outside,
+                  f'{m}/.no_exist': self.outside, 'rt/hf-cache/.locks': self.outside}
+        for rel, to in plants.items():
+            for name in renderings(self.L()):
+                w = self.work(); self.install(w)
+                (w / rel).parent.mkdir(parents=True, exist_ok=True)
+                (w / rel).symlink_to(to)
+                was = tree(self.outside)
+                r = self.step(self.L(), 'Download the weights', w, name)
+                self.assertEqual(r.returncode, 0, (rel, name, r.stderr))
+                self.assertEqual(tree(self.outside), was, (rel, name))
+                self.assertFalse((w / m / 'blobs').is_symlink() or (w / m / 'refs').is_symlink(), (rel, name))
+                self.assertEqual((w / m / 'refs/main').read_text(), REV, (rel, name))
+                self.assertEqual((w / m / f'snapshots/{REV}/config.json').read_text(), '{}', (rel, name))  # the internal link kept
+                self.assertEqual(staging_left(w), [], (rel, name))
+
+    def test_failed_hub_publish_restores_the_cache(self):
+        m = 'rt/hf-cache/models--org--model'
         for name in renderings(self.L()):
             w = self.work(); self.install(w)
-            (w / m).mkdir(parents=True)
-            (w / m / '.local-ai-main').symlink_to(self.outside / 'victim')
-            r = self.step(self.L(), 'Download the weights', w, name)
+            self.assertEqual(self.step(self.L(), 'Download the weights', w, name).returncode, 0, name)
+            (w / m / 'KEEP').write_text('the previous cache\n')
+            was = tree(w / m)
+            r = self.step(self.L(), 'Download the weights', w, name, FAIL_MV_TO=m)
+            self.assertNotEqual(r.returncode, 0, name)
+            self.assertEqual(tree(w / m), was, name)
+            self.assertEqual(staging_left(w), [], name)
+
+    def test_planted_fixed_temp_link_is_never_written(self):
+        for name in renderings(self.L()):
+            w = self.work(); (w / 'launcher').mkdir()
+            (w / 'launcher/.local-ai-main').symlink_to(self.outside / 'victim')
+            r = self.step(self.L(), 'Write the launcher', w, name)
             self.assertEqual(r.returncode, 0, (name, r.stderr))
             self.assertEqual((self.outside / 'victim').read_text(), 'untouched\n', name)
-            self.assertFalse((w / m / 'main').is_symlink(), name)
-            self.assertEqual((w / m / 'main').read_text(), REV, name)
-            self.assertEqual([f for f in staging_left(w) if not f.endswith('.local-ai-main')], [], name)
+            self.assertEqual((w / 'launcher/serve.py').read_text().rstrip(), SERVER.rstrip(), name)
 
     def test_hostile_cache_during_download(self):
-        for hostile in ('refs', 'ref', 'refdir'):
+        for hostile in ('refs', 'ref', 'refdir', 'escape', 'climb', 'fifo'):
             for name in renderings(self.L()):
                 w = self.work(); self.install(w)
                 was = tree(self.outside)
                 r = self.step(self.L(), 'Download the weights', w, name, FAKE_HF_HOSTILE=hostile)
                 self.assertNotEqual(r.returncode, 0, (hostile, name))
                 self.assertEqual(tree(self.outside), was, (hostile, name))
+                self.assertFalse((w / 'rt/hf-cache/models--org--model').exists(), (hostile, name))  # nothing published
                 self.assertEqual(staging_left(w), [], (hostile, name))
+
+    # r3: no ambient token, Hugging Face config, cache or .netrc reaches the download (synthetic values only)
+
+    SYNTHETIC = {'HF_TOKEN': 'hf_synthetic_r3_marker', 'HUGGING_FACE_HUB_TOKEN': 'hf_synthetic_r3_marker',
+                 'HF_ENDPOINT': 'https://synthetic.invalid', 'HF_TOKEN_PATH': '/nonexistent/synthetic-token'}
+
+    def isolated(self, w, seen):
+        for k in ('HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'HF_ENDPOINT', 'HF_TOKEN_PATH', 'NETRC'):
+            self.assertIsNone(seen.get(k), k)
+        hub = Path(w).resolve() / 'rt/hf-cache'
+        for k in ('HF_HOME', 'HF_XET_CACHE', 'HOME'):
+            self.assertTrue(Path(seen[k]).resolve().is_relative_to(hub) and '.local-ai-hub.' in seen[k], (k, seen[k]))
+
+    def test_pinned_download_uses_no_ambient_credentials(self):
+        for name in renderings(self.L()):
+            w = self.work(); self.install(w)
+            env = {**self.SYNTHETIC, 'HF_HOME': str(self.outside / 'hf-home'), 'HF_XET_CACHE': str(self.outside / 'xet'),
+                   'NETRC': str(self.outside / 'netrc')}
+            r = self.step(self.L(), 'Download the weights', w, name, **env)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            seen = json.loads((w / 'HUB_ENV').read_text())
+            self.assertIs(seen['token'], False, name)
+            self.isolated(w, seen)
+            self.assertEqual(tree(self.outside), {'victim': hashlib.sha256(b'untouched\n').hexdigest()}, name)
+
+    def test_ambient_hf_download_uses_no_ambient_credentials(self):
+        L = {k: v for k, v in self.L().items() if k != 'runtime'}  # host hub weights without a runtime: hf from PATH
+        hf = self.d / 'hf-bin'; hf.mkdir(exist_ok=True)
+        (hf / 'hf').write_text(FAKE_HF); (hf / 'hf').chmod(0o755)
+        for name in renderings(L):
+            w = self.work()
+            r = self.step(L, 'Download the weights', w, name, PATH=f'{hf}:{self.bin}:/usr/bin:/bin', **self.SYNTHETIC)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            seen = dict(line.split('=', 1) for line in (w / 'HF_ENV').read_text().splitlines() if '=' in line)
+            self.isolated(w, seen)
+            self.assertEqual((w / 'rt/hf-cache/models--org--model/refs/main').read_text(), REV, name)
+
+    # r3: archive members and links are checked before anything runs or is published; safe internal links are kept
+
+    def crafted(self, members):
+        """Serve a .tar.gz holding `members` [(name, kind, value, mode)] and return the launch pinning it."""
+        f = self.server / ARCHIVE
+        with tarfile.open(f, 'w:gz') as t:
+            for name, kind, value, mode in members:
+                i = tarfile.TarInfo(name); i.mode = mode
+                if kind == 'file':
+                    data = value.encode(); i.size = len(data); t.addfile(i, io.BytesIO(data))
+                else:
+                    i.type = {'sym': tarfile.SYMTYPE, 'hard': tarfile.LNKTYPE, 'fifo': tarfile.FIFOTYPE, 'dir': tarfile.DIRTYPE}[kind]
+                    i.linkname = value or ''
+                    t.addfile(i)
+        return self.L((hashlib.sha256(f.read_bytes()).hexdigest(),) + self.shas[1:])
+
+    def test_archive_links_and_members_are_checked(self):
+        base = self.work(); self.install(base)
+        before_ = tree(base / 'rt')
+        py = ('python/bin/python3', 'file', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755)
+        cases = {  # name: (members, the refusal it must give)
+            'interpreter is an absolute link to an ambient python': ([('python/bin/python3', 'sym', sys.executable, 0o777)], 'is absolute'),
+            'interpreter is a relative link out': ([('python/bin/python3', 'sym', '../../' * 12 + 'usr/bin/python3', 0o777)], 'leaves'),
+            'interpreter is a dangling link': ([('python/bin/python3', 'sym', 'python3.12', 0o777)], 'dangling'),
+            'a directory link out': ([py, ('python/lib', 'sym', '../..', 0o777)], 'leaves'),
+            'a member that climbs': ([py, ('../evil', 'file', 'x', 0o644)], 'leaves the archive'),
+            'an absolute member': ([py, ('/tmp/local-ai-evil', 'file', 'x', 0o644)], 'leaves the archive'),
+            'a fifo': ([py, ('python/pipe', 'fifo', None, 0o644)], 'device, fifo or socket'),
+            'a hard link out': ([py, ('python/h', 'hard', '/etc/hosts', 0o644)], ''),
+        }
+        for case, (members, says) in cases.items():
+            L = self.crafted(members)
+            for name in renderings(L):
+                w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
+                was = tree(self.outside)
+                r = self.step(L, 'Install the runtime', w, name)
+                self.assertNotEqual(r.returncode, 0, (case, name))
+                self.assertIn(says, r.stderr, (case, name))
+                self.assertEqual(tree(w / 'rt'), before_, (case, name))
+                self.assertEqual(tree(self.outside), was, (case, name))
+                self.assertEqual(staging_left(w), [], (case, name))
+                self.assertFalse(Path('/tmp/local-ai-evil').exists(), (case, name))
+
+    def test_safe_internal_links_are_kept(self):
+        L = self.crafted([('python/bin/python3.12', 'file', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755),
+                          ('python/bin/python3', 'sym', 'python3.12', 0o777), ('python/lib', 'dir', None, 0o755),
+                          ('python/lib/here', 'sym', '.', 0o777), ('python/lib/up', 'sym', '../bin/python3', 0o777),
+                          ('python/bin/python3-hard', 'hard', 'python/bin/python3.12', 0o755)])
+        for name in renderings(L):
+            w = self.work()
+            r = self.step(L, 'Install the runtime', w, name)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            self.assertEqual(os.readlink(w / 'rt/python/bin/python3'), 'python3.12', name)
+            self.assertEqual(os.readlink(w / 'rt/python/lib/up'), '../bin/python3', name)
+            ok = subprocess.run(['./rt/python/bin/python3', '-I', '-c', 'pass'], cwd=w)
+            self.assertEqual(ok.returncode, 0, name)
 
     def test_launcher_over_a_directory_is_refused(self):
         for name in renderings(self.L()):

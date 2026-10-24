@@ -185,11 +185,18 @@ def _weights(l):
 
 _NOLINK = ('nolink() { for p; do if [ -L "$p" ]; then echo "local-ai: $p is a symlink; refusing to write through it" >&2; exit 1; fi; done; }')
 _HUB = ("import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download; "
-        "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None)")
+        "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None, token=False)")
+# Every link under a staged tree resolves inside it (relative, not dangling), every hard link stays inside it, and it holds
+# no device, fifo, socket or set-id file. The same text in both SDKs.
+_CONFINE = "confine() {\n  b=$(cd -P \"$1\" && pwd -P)\n  if [ -n \"$(find \"$1\" ! -type f ! -type d ! -type l)\" ]; then echo \"local-ai: $1 holds a device, fifo or socket\" >&2; exit 1; fi\n  if [ -n \"$(find \"$1\" -type f \\( -perm -4000 -o -perm -2000 \\))\" ]; then echo \"local-ai: $1 holds a setuid or setgid file\" >&2; exit 1; fi\n  find \"$1\" -type l | while IFS= read -r l; do\n    if [ ! -L \"$l\" ]; then echo \"local-ai: unexpected name under $1\" >&2; exit 1; fi\n    k=$(readlink \"$l\")\n    case $k in /*) echo \"local-ai: link $l is absolute\" >&2; exit 1;; esac\n    if [ ! -e \"$l\" ]; then echo \"local-ai: link $l is dangling\" >&2; exit 1; fi\n    if [ -d \"$l\" ]; then r=$(cd -P \"$l\" && pwd -P); else\n      case ${k##*/} in .|..) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n      r=$(cd -P \"$(dirname \"$l\")\" && cd -P \"$(dirname \"$k\")\" && pwd -P)/${k##*/}\n    fi\n    case $r/ in \"$b\"/*) ;; *) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n  done\n  find \"$1\" -type f -links +1 | while IFS= read -r f; do\n    if [ \"$(ls -ld \"$f\" | awk '{print $2}')\" != \"$(find \"$1\" -samefile \"$f\" | wc -l | tr -d ' ')\" ]; then echo \"local-ai: $f is hard-linked outside $1\" >&2; exit 1; fi\n  done\n}"
+# The download sees no ambient Hugging Face token, config, cache or .netrc: only directories inside its staging cache.
+_HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\"; }"
 
 
+_HUBUNDO = ('hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; '
+            'if [ -e "$o/old" ]; then rm -rf "$1"; mv "$o/old" "$1" || keep "$o/old"; fi; exit 1; }')
 _KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }'
-_CLEAN = "trap 'if [ -n \"$t\" ]; then rm -f \"$t\"; fi' EXIT"
+_CLEAN = "c= o= t=\ntrap 'for x in \"$c\" \"$o\" \"$t\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done' EXIT"
 
 
 def _prefixes(path):
@@ -225,6 +232,7 @@ def _runtime_steps(l):
             f'curl -fL -o "$s"/{_q(f)} {_q(a["url"])}',
             f"(cd \"$s\" && echo '{a['sha256']}  {f}' | shasum -a 256 -c -)",
             'mkdir "$s/x" "$s/old"',
+            f'tar -tzf "$s"/{_q(f)} | while IFS= read -r m; do case $m in /*|..|../*|*/..|*/../*) echo "local-ai: archive member $m leaves the archive" >&2; exit 1;; esac; done',
             f'tar -xzf "$s"/{_q(f)} -C "$s/x"',
             'test -n "$(ls -A "$s/x")"',
             'for n in $(ls -A "$s/x"); do',
@@ -232,7 +240,9 @@ def _runtime_steps(l):
             f'  nolink {d}/"$n"',
             *[f'  case {_q(x + "/")} in {d}/"$n"/*) echo "local-ai: archive entry $n would replace {x}" >&2; exit 1;; esac' for x in keep],
             "done",
-            *([f'"$s"/x/{_q(rt["python"][len(into) + 1:])} -I -c pass'] if rt.get("python") else []),
+            _CONFINE,
+            'confine "$s/x"',
+            *([f'test -f "$s"/x/{_q(rt["python"][len(into) + 1:])}', f'"$s"/x/{_q(rt["python"][len(into) + 1:])} -I -c pass'] if rt.get("python") else []),
             _KEEP,
             'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; '
             f'for n in $placed; do rm -rf {d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf {d}/"$n"; mv "$s/old/$n" {d}/"$n" || keep "$s/old"; done; exit 1; }}',
@@ -272,39 +282,48 @@ def _runtime_steps(l):
     return out
 
 
-def _write(path, body):
-    """Write a file through an exclusive temp file in its (checked) directory, renamed over `path` only if `path` is
-    neither a link nor a directory; the temp file is a fresh regular file that no one else could have created."""
-    return [f"t=$(mktemp {_q(_parent(path))}/.local-ai-tmp.XXXXXX)",
+def _write(dir_, path, label, body):
+    """Write a file through an exclusive temp file in its (checked) directory `dir_`, renamed over `path` only if that is
+    neither a link nor a directory; the temp file is a fresh regular file that no one else could have created. `dir_` and
+    `path` are shell words."""
+    return [f"t=$(mktemp {dir_}/.local-ai-tmp.XXXXXX)",
             'test -f "$t"',
             'test ! -L "$t"',
             *body('"$t"'),
             'chmod 644 "$t"',
-            f"nolink {_q(path)}",
-            f"if [ -d {_q(path)} ]; then echo \"local-ai: {path} is a directory\" >&2; exit 1; fi",
-            f'mv -f "$t" {_q(path)}']
+            f"nolink {path}",
+            f"if [ -d {path} ]; then echo \"local-ai: {label} is a directory\" >&2; exit 1; fi",
+            f'mv -f "$t" {path}']
 
 
 def _host_download(w, rt=None):
-    """Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub) whose pinned snapshot must exist and,
-    with `ref`, whose task-local refs/<ref> then names that revision. With a pinned runtime the download runs on its own
-    interpreter and huggingface_hub, never an `hf` from PATH."""
+    """Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub). A hub download goes into a fresh
+    staging cache beside `at`, with no ambient token or cache (token=False and _HUBENV); its pinned snapshot must exist and
+    every link in it must stay inside it; `ref` then names the revision; and only then does the staged model directory
+    replace the one in `at` by rename (put back if that fails). Nothing in `at` is written through. With a pinned runtime
+    the download runs on its own interpreter and huggingface_hub, never an `hf` from PATH."""
     if w.get("layout") != "hub":
         return f"hf download {w['repo']}{_files(w)} \\\n  --revision {w['revision']} \\\n  --local-dir {w['at']}"
     at, rev = w["at"], w["revision"]
-    m = f"{at}/models--{w['repo'].replace('/', '--')}"
-    owned = " ".join(_q(p) for p in [m, m + "/snapshots", f"{m}/snapshots/{rev}", m + "/refs", *([f"{m}/refs/{w['ref']}"] if w.get("ref") else [])])
+    name = f"models--{w['repo'].replace('/', '--')}"
+    m, staged = _q(f"{at}/{name}"), f'"$c"/{_q(name)}'
     fs = w.get("files") or []
     fs = fs if isinstance(fs, list) else [fs]
     if rt:
-        get = f"{_q('./' + rt['python'])} -I -c {_q(_HUB)} {_q(rt['packages']['target'])} {w['repo']} {rev} {_q(at)}" + "".join(f" {_q(f)}" for f in fs)
+        get = f"{_q('./' + rt['python'])} -I -c {_q(_HUB)} {_q(rt['packages']['target'])} {w['repo']} {rev} \"$c\"" + "".join(f" {_q(f)}" for f in fs)
     else:
-        get = f"hf download {w['repo']}{_files(w)} --revision {rev} --cache-dir {_q(at)}"
-    lines = [f"nolink {_prefixes(at)} {owned}", f"mkdir -p {_q(at)}", get, f"nolink {owned}", f"test -d {_q(f'{m}/snapshots/{rev}')}"]
+        get = f"hf download {w['repo']}{_files(w)} --revision {rev} --cache-dir \"$c\""
+    lines = [f"nolink {_prefixes(at)} {m}", f"mkdir -p {_q(at)}",
+             f"c=$(mktemp -d {_q(at)}/.local-ai-hub.XXXXXX)", f"o=$(mktemp -d {_q(at)}/.local-ai-old.XXXXXX)",
+             f'(hubenv "$c"; exec {get})',
+             f"test -d {staged}/snapshots/{rev}", f"confine {staged}"]
     if w.get("ref"):
-        lines += [f"mkdir -p {_q(m + '/refs')}", f"nolink {_q(m + '/refs')}",
-                  *_write(f"{m}/refs/{w['ref']}", lambda t: [f"printf '%s' {rev} > {t}"])]
-    return lines
+        lines += [f"mkdir -p {staged}/refs", f"nolink {staged}/refs",
+                  *_write(f"{staged}/refs", f"{staged}/refs/{_q(w['ref'])}", f"refs/{w['ref']}", lambda t: [f"printf '%s' {rev} > {t}"])]
+    return lines + [f"nolink {_prefixes(at)} {m}",
+                    f'if [ -e {m} ]; then mv {m} "$o/old" || hubundo {m}; fi',
+                    f"mv {staged} {m} || hubundo {m}",
+                    'rm -rf "$c" "$o"', "c= o="]
 
 
 def _host_steps(l):
@@ -324,14 +343,15 @@ def _host_steps(l):
             out.append({"title": "Install the native engine", "code": _install(l["install"])})
     if l.get("weights"):
         if any(w.get("layout") == "hub" for w in l["weights"]):  # a cache: checked, confined and stopped at its first failure
-            out.append({"title": "Download the weights", "code": _strict([_NOLINK, "t=", _CLEAN, *[x for w in l["weights"] for x in _host_download(w, rt)]])})
+            out.append({"title": "Download the weights", "code": _strict([_NOLINK, _CLEAN, _KEEP, _HUBUNDO, _CONFINE, _HUBENV,
+                                                                         *[x for w in l["weights"] for x in _host_download(w, rt)]])})
         else:
             out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
     if l.get("config"):
         at = l["config"]["at"]
         if rt:
-            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, "t=", _CLEAN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
-                                                                         *_write(at, lambda t: [f"cat > {t} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])])})
+            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, _CLEAN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
+                                                                         *_write(_q(_parent(at)), _q(at), at, lambda t: [f"cat > {t} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])])})
         else:
             mk = f"mkdir -p {at.rsplit('/', 1)[0]}\n" if "/" in at else ""
             out.append({"title": "Write the launcher", "code": f"{mk}cat > {at} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"})

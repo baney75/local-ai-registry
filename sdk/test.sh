@@ -15,7 +15,10 @@ def downloads(st):
             continue
         strict = step["code"].startswith("(\nset -e\n")
         for cmd in step["code"].split("\n") if strict else step["code"].split("\n\n"):
-            argv = shlex.split(cmd.replace("\\\n", ""))
+            cmd = cmd.replace("\\\n", "")
+            if cmd.startswith('(hubenv "$c"; exec ') and cmd.endswith(")"):  # a download isolated in its staging cache
+                cmd = cmd[len('(hubenv "$c"; exec '):-1]
+            argv = shlex.split(cmd)
             if argv[:2] == ["hf", "download"]:
                 out.append((argv[2], argv[3:argv.index("--revision")]))
             elif "-c" in argv and "snapshot_download" in " ".join(argv):

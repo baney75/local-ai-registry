@@ -130,9 +130,16 @@ function checkPaths(l) {
 
 const NOLINK = 'nolink() { for p; do if [ -L "$p" ]; then echo "local-ai: $p is a symlink; refusing to write through it" >&2; exit 1; fi; done; }';
 const HUB = "import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download; " +
-  "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None)";
+  "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None, token=False)";
+// Every link under a staged tree resolves inside it (relative, not dangling), every hard link stays inside it, and it holds
+// no device, fifo, socket or set-id file. The same text in both SDKs.
+const CONFINE = "confine() {\n  b=$(cd -P \"$1\" && pwd -P)\n  if [ -n \"$(find \"$1\" ! -type f ! -type d ! -type l)\" ]; then echo \"local-ai: $1 holds a device, fifo or socket\" >&2; exit 1; fi\n  if [ -n \"$(find \"$1\" -type f \\( -perm -4000 -o -perm -2000 \\))\" ]; then echo \"local-ai: $1 holds a setuid or setgid file\" >&2; exit 1; fi\n  find \"$1\" -type l | while IFS= read -r l; do\n    if [ ! -L \"$l\" ]; then echo \"local-ai: unexpected name under $1\" >&2; exit 1; fi\n    k=$(readlink \"$l\")\n    case $k in /*) echo \"local-ai: link $l is absolute\" >&2; exit 1;; esac\n    if [ ! -e \"$l\" ]; then echo \"local-ai: link $l is dangling\" >&2; exit 1; fi\n    if [ -d \"$l\" ]; then r=$(cd -P \"$l\" && pwd -P); else\n      case ${k##*/} in .|..) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n      r=$(cd -P \"$(dirname \"$l\")\" && cd -P \"$(dirname \"$k\")\" && pwd -P)/${k##*/}\n    fi\n    case $r/ in \"$b\"/*) ;; *) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n  done\n  find \"$1\" -type f -links +1 | while IFS= read -r f; do\n    if [ \"$(ls -ld \"$f\" | awk '{print $2}')\" != \"$(find \"$1\" -samefile \"$f\" | wc -l | tr -d ' ')\" ]; then echo \"local-ai: $f is hard-linked outside $1\" >&2; exit 1; fi\n  done\n}";
+// The download sees no ambient Hugging Face token, config, cache or .netrc: only directories inside its staging cache.
+const HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\"; }";
 const KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }';
-const CLEAN = `trap 'if [ -n "$t" ]; then rm -f "$t"; fi' EXIT`;
+const CLEAN = `c= o= t=\ntrap 'for x in "$c" "$o" "$t"; do if [ -n "$x" ]; then rm -rf "$x"; fi; done' EXIT`;
+const HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; ' +
+  'if [ -e "$o/old" ]; then rm -rf "$1"; mv "$o/old" "$1" || keep "$o/old"; fi; exit 1; }';
 /** `a/b/c` -> `a a/b a/b/c`: every directory a write to `path` passes through, quoted. */
 const prefixes = (path) => path.split("/").map((_, i, p) => q(p.slice(0, i + 1).join("/"))).join(" ");
 const parent = (path) => (path.includes("/") ? path.replace(/\/[^/]*$/, "") : ".");
@@ -156,6 +163,7 @@ function runtimeSteps(l) {
       `curl -fL -o "$s"/${q(f)} ${q(a.url)}`,
       `(cd "$s" && echo '${a.sha256}  ${f}' | shasum -a 256 -c -)`,
       'mkdir "$s/x" "$s/old"',
+      `tar -tzf "$s"/${q(f)} | while IFS= read -r m; do case $m in /*|..|../*|*/..|*/../*) echo "local-ai: archive member $m leaves the archive" >&2; exit 1;; esac; done`,
       `tar -xzf "$s"/${q(f)} -C "$s/x"`,
       'test -n "$(ls -A "$s/x")"',
       'for n in $(ls -A "$s/x"); do',
@@ -163,7 +171,9 @@ function runtimeSteps(l) {
       `  nolink ${d}/"$n"`,
       ...keep.map((x) => `  case ${q(`${x}/`)} in ${d}/"$n"/*) echo "local-ai: archive entry $n would replace ${x}" >&2; exit 1;; esac`),
       "done",
-      ...(rt.python ? [`"$s"/x/${q(rt.python.slice(into.length + 1))} -I -c pass`] : []),
+      CONFINE,
+      'confine "$s/x"',
+      ...(rt.python ? [`test -f "$s"/x/${q(rt.python.slice(into.length + 1))}`, `"$s"/x/${q(rt.python.slice(into.length + 1))} -I -c pass`] : []),
       KEEP,
       'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; ' +
       `for n in $placed; do rm -rf ${d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf ${d}/"$n"; mv "$s/old/$n" ${d}/"$n" || keep "$s/old"; done; exit 1; }`,
@@ -203,24 +213,32 @@ function runtimeSteps(l) {
   return out;
 }
 
-/** Write a file through an exclusive temp file in its (checked) directory, renamed over `path` only if `path` is
- *  neither a link nor a directory; the temp file is a fresh regular file that no one else could have created. */
-const write = (path, body) => [`t=$(mktemp ${q(parent(path))}/.local-ai-tmp.XXXXXX)`, 'test -f "$t"', 'test ! -L "$t"', ...body('"$t"'),
-  'chmod 644 "$t"', `nolink ${q(path)}`, `if [ -d ${q(path)} ]; then echo "local-ai: ${path} is a directory" >&2; exit 1; fi`, `mv -f "$t" ${q(path)}`];
+/** Write a file through an exclusive temp file in its (checked) directory `dir`, renamed over `path` only if that is
+ *  neither a link nor a directory; the temp file is a fresh regular file that no one else could have created. `dir` and
+ *  `path` are shell words. */
+const write = (dir, path, label, body) => [`t=$(mktemp ${dir}/.local-ai-tmp.XXXXXX)`, 'test -f "$t"', 'test ! -L "$t"', ...body('"$t"'),
+  'chmod 644 "$t"', `nolink ${path}`, `if [ -d ${path} ]; then echo "local-ai: ${label} is a directory" >&2; exit 1; fi`, `mv -f "$t" ${path}`];
 
-/** Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub) whose pinned snapshot must exist and,
- *  with `ref`, whose task-local refs/<ref> then names that revision. With a pinned runtime the download runs on its own
- *  interpreter and huggingface_hub, never an `hf` from PATH. */
+/** Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub). A hub download goes into a fresh
+ *  staging cache beside `at`, with no ambient token or cache (token=False and HUBENV); its pinned snapshot must exist and
+ *  every link in it must stay inside it; `ref` then names the revision; and only then does the staged model directory
+ *  replace the one in `at` by rename (put back if that fails). Nothing in `at` is written through. With a pinned runtime
+ *  the download runs on its own interpreter and huggingface_hub, never an `hf` from PATH. */
 function hostDownload(w, rt) {
   if (w.layout !== "hub") return `hf download ${w.repo}${files(w)} \\\n  --revision ${w.revision} \\\n  --local-dir ${w.at}`;
-  const at = w.at, rev = w.revision, m = `${at}/models--${w.repo.replace("/", "--")}`;
-  const own = [m, `${m}/snapshots`, `${m}/snapshots/${rev}`, `${m}/refs`, ...(w.ref ? [`${m}/refs/${w.ref}`] : [])].map(q).join(" ");
+  const at = w.at, rev = w.revision, name = `models--${w.repo.replace("/", "--")}`;
+  const m = q(`${at}/${name}`), staged = `"$c"/${q(name)}`;
   const fs = Array.isArray(w.files) ? w.files : w.files ? [w.files] : [];
-  const get = rt ? `${q(`./${rt.python}`)} -I -c ${q(HUB)} ${q(rt.packages.target)} ${w.repo} ${rev} ${q(at)}${fs.map((f) => ` ${q(f)}`).join("")}`
-    : `hf download ${w.repo}${files(w)} --revision ${rev} --cache-dir ${q(at)}`;
-  const lines = [`nolink ${prefixes(at)} ${own}`, `mkdir -p ${q(at)}`, get, `nolink ${own}`, `test -d ${q(`${m}/snapshots/${rev}`)}`];
-  if (w.ref) lines.push(`mkdir -p ${q(`${m}/refs`)}`, `nolink ${q(`${m}/refs`)}`, ...write(`${m}/refs/${w.ref}`, (t) => [`printf '%s' ${rev} > ${t}`]));
-  return lines;
+  const get = rt ? `${q(`./${rt.python}`)} -I -c ${q(HUB)} ${q(rt.packages.target)} ${w.repo} ${rev} "$c"${fs.map((f) => ` ${q(f)}`).join("")}`
+    : `hf download ${w.repo}${files(w)} --revision ${rev} --cache-dir "$c"`;
+  const lines = [`nolink ${prefixes(at)} ${m}`, `mkdir -p ${q(at)}`,
+    `c=$(mktemp -d ${q(at)}/.local-ai-hub.XXXXXX)`, `o=$(mktemp -d ${q(at)}/.local-ai-old.XXXXXX)`,
+    `(hubenv "$c"; exec ${get})`,
+    `test -d ${staged}/snapshots/${rev}`, `confine ${staged}`];
+  if (w.ref) lines.push(`mkdir -p ${staged}/refs`, `nolink ${staged}/refs`,
+    ...write(`${staged}/refs`, `${staged}/refs/${q(w.ref)}`, `refs/${w.ref}`, (t) => [`printf '%s' ${rev} > ${t}`]));
+  return [...lines, `nolink ${prefixes(at)} ${m}`, `if [ -e ${m} ]; then mv ${m} "$o/old" || hubundo ${m}; fi`,
+    `mv ${staged} ${m} || hubundo ${m}`, 'rm -rf "$c" "$o"', "c= o="];
 }
 
 /** A program on the host. One with pinned packages or weights (MLX, oMLX or llama.cpp on Apple silicon) also downloads
@@ -238,13 +256,13 @@ function hostSteps(l) {
     if (l.pip && /^https:\/\/\S+\.tar\.gz#sha256=[0-9a-f]{64}$/.test(l.install ?? "")) out.push({ title: "Install the native engine", code: install(l.install) });
   }
   if (l.weights?.length) {
-    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, "t=", CLEAN, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
+    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, CLEAN, KEEP, HUBUNDO, CONFINE, HUBENV, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
     else out.push({ title: "Download the weights", code: l.weights.map((w) => hostDownload(w)).join("\n\n") });
   }
   if (l.config) {
     const at = l.config.at;
-    if (rt) out.push({ title: "Write the launcher", code: strict([NOLINK, "t=", CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
-      ...write(at, (t) => [`cat > ${t} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`])]) });
+    if (rt) out.push({ title: "Write the launcher", code: strict([NOLINK, CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
+      ...write(q(parent(at)), q(at), at, (t) => [`cat > ${t} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`])]) });
     else out.push({ title: "Write the launcher", code: `${at.includes("/") ? `mkdir -p ${at.replace(/\/[^/]*$/, "")}\n` : ""}cat > ${at} <<'EOF'\n${l.config.text.trimEnd()}\nEOF` });
   }
   if (l.sysctl) out.push({ title: "Raise the GPU memory limit (resets on reboot)", code: Object.entries(l.sysctl).map(([k, v]) => `sudo sysctl ${k}=${v}`).join("\n") });
