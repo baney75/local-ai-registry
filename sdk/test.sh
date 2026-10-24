@@ -7,6 +7,31 @@ import json, os, shlex, subprocess, sys
 sys.path.insert(0, "sdk/python")
 import local_ai_registry as L
 cat = json.load(open("dist/catalog.json"))
+def downloads(st):
+    """(repo, files) of each weights download in the steps: `hf download` lines, or the pinned runtime's snapshot_download."""
+    out = []
+    for step in st:
+        if step["title"] != "Download the weights":
+            continue
+        strict = step["code"].startswith("(\nset -e\n")
+        for cmd in step["code"].split("\n") if strict else step["code"].split("\n\n"):
+            argv = shlex.split(cmd.replace("\\\n", ""))
+            if argv[:2] == ["hf", "download"]:
+                out.append((argv[2], argv[3:argv.index("--revision")]))
+            elif "-c" in argv and "snapshot_download" in " ".join(argv):
+                i = argv.index("-c")
+                out.append((argv[i + 3], argv[i + 6:]))
+    return out
+def check_downloads(k, launch, st):
+    weights = launch.get("weights") or []
+    weights = weights if isinstance(weights, list) else [weights]
+    got = downloads(st)
+    assert len(got) == len([w for w in weights if w and w.get("repo")]), (k, got)
+    for w, (repo, fs) in zip(weights, got):
+        files = w.get("files") or []
+        files = files if isinstance(files, list) else [files]
+        assert repo == w["repo"], (k, repo)
+        assert fs == files, f"download ignores selected files for {k}"
 # Identical driver names need memory to distinguish 10 and 12 GB variants.
 variants = {"cards": {
     "rtx-3080-10gb": {"name": "GeForce RTX 3080", "vram_gb": 10},
@@ -44,14 +69,7 @@ for i, (got, sts) in json.loads(js).items():
             command = st[-1]["code"]
             assert "--gpus" not in command and "--device" not in command, f"CPU launch requires a GPU for {k}"
         launch = cat["recipes"][k]["launch"]
-        weights = launch.get("weights") or []
-        weights = weights if isinstance(weights, list) else [weights]
-        downloads = [shlex.split(cmd.replace("\\\n", "")) for step in st if step["title"] == "Download the weights" for cmd in step["code"].split("\n\n")]
-        for w, argv in zip(weights, downloads):
-            files = w.get("files") or []
-            files = files if isinstance(files, list) else [files]
-            assert argv[:3] == ["hf", "download", w["repo"]], (k, argv)
-            assert argv[3:argv.index("--revision")] == files, f"download ignores selected files for {k}"
+        check_downloads(k, launch, st)
         if launch.get("prepare"):
             prep = next(s["code"] for s in st if s["title"] == "Prepare the model (first start)")
             argv = shlex.split(prep.split("\n", 1)[1].replace("\\\n", ""))
@@ -156,6 +174,7 @@ for k, r in cases.items():
     if k.startswith("ok: "):
         assert js[k] == [L.steps(copy.deepcopy(r)), L.command(copy.deepcopy(r))], f"js and python differ for runtime {k}"
         assert js[k][1].startswith("set -e\n\n"), f"command for {k} does not stop at the first failure"
+        check_downloads(k, r["launch"], js[k][0])
     else:
         assert "threw" in js[k] and js[k]["threw"].startswith("invalid host runtime"), f"js renders {k}: {js[k]}"
         try:
