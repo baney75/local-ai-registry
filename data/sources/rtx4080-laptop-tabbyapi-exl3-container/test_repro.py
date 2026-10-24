@@ -164,6 +164,26 @@ esac
 '''
 
 
+DATE = r'''#!/usr/bin/env bash
+# fake date: passes through, except that with FAKE_LATE_SIGNAL (e.g. TERM or TERM,INT) it signals the
+# controller's own bash once, from the first `date` after cleanup.ok exists: inside the final verdict stamp.
+if [ -n "${FAKE_LATE_SIGNAL:-}" ] && ls "$STORE"/run-*/cleanup.ok > /dev/null 2>&1 && [ ! -e "$FAKE_STATE/late-sent" ]; then
+  : > "$FAKE_STATE/late-sent"
+  p=$PPID
+  while [ "${p:-1}" -gt 1 ]; do  # the repro.sh bash whose parent is the outer timeout
+    if [[ "$(tr '\0' ' ' < /proc/$p/cmdline)" == "bash "*repro.sh* ]]; then
+      pp=$(awk '{print $4}' /proc/$p/stat)
+      [[ "$(tr '\0' ' ' < /proc/$pp/cmdline)" == timeout* ]] && break
+    fi
+    p=$(awk '{print $4}' /proc/$p/stat)
+  done
+  echo "late signals ${FAKE_LATE_SIGNAL} -> $p" >> "$FAKE_STATE/late-sent"
+  for sig in ${FAKE_LATE_SIGNAL//,/ }; do kill -s "$sig" "$p"; done
+fi
+exec "$FAKE_REAL_DATE" "$@"
+'''
+
+
 def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
@@ -192,14 +212,14 @@ class Repro(unittest.TestCase):
             for l in links:
                 os.symlink(real, os.path.join(self.libdir, l))
         self.bin = os.path.join(self.t, "bin"); os.makedirs(self.bin)
-        for name, text in (("podman", PODMAN), ("nvidia-smi", NVSMI)):
+        for name, text in (("podman", PODMAN), ("nvidia-smi", NVSMI), ("date", DATE)):
             p = os.path.join(self.bin, name); open(p, "w").write(text); os.chmod(p, 0o755)
         self.state = os.path.join(self.t, "state"); os.makedirs(os.path.join(self.state, "c"))
         self.store = os.path.join(self.t, "store")
         self.home = os.path.join(self.t, "home"); os.makedirs(self.home)
         path = ":".join(d for d in os.environ["PATH"].split(":") if ".local/bin" not in d and "mise" not in d)  # no real parish-media
         self.env = {**os.environ, "HOME": self.home, "PATH": self.bin + ":" + path, "FAKE_STATE": self.state, "FAKE_PY": sys.executable,
-                    "FAKE_TEST": os.path.join(self.repo, REL, "test_repro.py"), "FAKE_DIGEST": DIGEST, "MODEL_DIR": self.model, "STORE": self.store,
+                    "FAKE_TEST": os.path.join(self.repo, REL, "test_repro.py"), "FAKE_DIGEST": DIGEST, "FAKE_REAL_DATE": shutil.which("date"), "MODEL_DIR": self.model, "STORE": self.store,
                     "LIBDIR": self.libdir, "SERVER_PORT": str(free_port()), "REC_PORT": str(free_port()), "PYTHON": sys.executable,
                     "HEALTH_TIMEOUT": "60", "LAB_TIMEOUT": "300", "REPEAT_TIMEOUT": "120", "REPRO_TIMEOUT": "600"}
         self.env.pop("SYBIL_REPRO_BOUNDED", None)
@@ -221,8 +241,11 @@ class Repro(unittest.TestCase):
         t0 = time.monotonic()
         out = os.path.join(self.t, f"repro-out-{time.monotonic_ns()}.txt")
         with open(out, "w") as f:  # a file, not a pipe: a leaked descriptor cannot hang the harness (assertClean finds the leak)
+            # SIGINT back to default, as from a user's shell: a job started with `&` by a non-interactive shell
+            # inherits SIGINT ignored, and bash cannot trap a signal that was ignored when it started
             r = subprocess.run(["bash", os.path.join(self.repo, REL, "repro.sh")], env={**self.env, **env}, stdin=subprocess.DEVNULL,
-                               stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+                               stdout=f, stderr=subprocess.STDOUT, timeout=timeout,
+                               preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
         self.out = open(out).read()
         self.elapsed = time.monotonic() - t0
         return r.returncode
@@ -445,6 +468,36 @@ class Repro(unittest.TestCase):
 
     def test_deadline_during_cleanup_after_failure(self):
         self.assertEqual(self.deadline_in_cleanup(FAKE_FAULTS="reasoning_length"), "8")
+
+    # ---- Sol r4: a signal inside the final verdict stamp, after cleanup has read its status, must still fail the run
+    def late_signal(self, sigs, **env):
+        rc = self.run_repro(FAKE_LATE_SIGNAL=sigs, **env)
+        sent = open(os.path.join(self.state, "late-sent")).read()
+        self.assertIn(f"late signals {sigs} -> ", sent)
+        log = open(os.path.join(self.run_dir(), "repro.log")).read()
+        tail = log[log.index("cleanup (reserve"):]  # the record goes straight to the file, the verdict through tee: either order
+        self.assertIn("cleanup verdict:", tail)
+        self.assertIn("during cleanup at", tail)
+        self.assertIn("removed (positively gone)", tail)
+        self.assertClean()
+        return rc, tail
+
+    def test_late_term_after_pass(self):
+        rc, tail = self.late_signal("TERM")
+        self.assertEqual(rc, 143, tail)  # the verdict line may still read "exit 0"; the process status is what counts
+
+    def test_late_int_after_pass(self):
+        rc, tail = self.late_signal("INT")
+        self.assertEqual(rc, 130, tail)
+
+    def test_late_term_then_int(self):
+        rc, tail = self.late_signal("TERM,INT")
+        self.assertEqual(rc, 143, tail)  # the first signal sets the status
+        self.assertIn("signal 15 during cleanup", tail); self.assertIn("signal 2 during cleanup", tail)
+
+    def test_late_term_keeps_prior_failure(self):
+        rc, tail = self.late_signal("TERM", FAKE_FAULTS="reasoning_length")
+        self.assertEqual(rc, 8, tail)
 
     def test_container_start_failure(self):
         self.assertEqual(self.run_repro(FAKE_RUN_FAIL="1"), 5); self.assertClean()

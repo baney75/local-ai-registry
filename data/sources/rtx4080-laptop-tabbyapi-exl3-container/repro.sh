@@ -223,10 +223,14 @@ cleanup() {
 }
 # A signal outside cleanup ends the run, and the EXIT trap then cleans up. A signal while cleanup is running
 # (the overall deadline can land in it) is recorded and cleanup carries on to its verdict: the outer
-# timeout's 540 s KILL reserve is what bounds it.
+# timeout's 540 s KILL reserve is what bounds it. The handler sets RC itself (keeping an earlier failure),
+# so a signal at any point of cleanup, even after the verdict line, makes the process exit non-zero. The
+# verdict line's text is expanded before such a late signal and can still say "exit 0"; the appended
+# "signal ... during cleanup" record and the process exit status are what count.
 on_signal() {
   if [ "$IN_CLEANUP" = 1 ]; then
     SIGNALLED=${SIGNALLED:-$1}
+    [ "$RC" -eq 0 ] && RC=$1
     # straight to the run log: bash can run this inside the interrupted command's redirections (server.log)
     stamp "signal $(( $1 - 128 )) during cleanup at $(date +%s.%N): deferred; cleanup continues" >> "$RUN/repro.log" 2>&1
     return 0
