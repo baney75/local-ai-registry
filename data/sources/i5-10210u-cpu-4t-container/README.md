@@ -71,21 +71,21 @@ On 2026-10-24 from 00:16:00 to 00:28:00 UTC, the committed `repro.sh` (commit 6c
 - **Seven natural ends, captured.** [check.jsonl](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.check.jsonl) shows stop, stop, tool_calls, stop, stop, stop (stream) and stop (stream), parsed from the relay's raw HTTP. No limits were sent. The raw relay copies are in [the relay directory](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.relay/), with a SHA256 for each file in [relay-sha256.txt](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.relay-sha256.txt). The [server log](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.server.log) shows every release with `truncated = 0`, at 70 to 5,757 tokens.
 - **Cleanup.** The server log was saved (28,269 bytes), and only then was container e7d0ee6c… (label `io.local-ai-registry.repro=cpu-4t-llamacpp.LuFWT3xu`) removed and confirmed gone. A readback afterwards found no task containers, no llama-server, no helper processes and both ports closed ([cleanup-readback](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.cleanup-readback.txt)).
 
-**CPU attribution.** A task logger, separate from the lab, recorded every second ([baseline](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.baseline-hostwatch.csv), [run](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.run-hostwatch.csv)):
+**Host CPU.** A task logger, separate from the lab, recorded once a second ([baseline](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.baseline-hostwatch.csv), [run](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.run-hostwatch.csv)):
 
-- host CPU busy from `/proc/stat`, as a share of all 8 hardware threads;
+- host CPU busy from `/proc/stat` deltas, as a share of all 8 hardware threads;
 - the load average;
-- free memory and swap;
-- `own_cpu_pct`, the CPU used by this run's own process trees (`repro.sh` and the container), from `/proc/<pid>/stat` only.
+- free memory and swap.
 
-Before the run, on AC power with the default governor, 75 samples averaged 0.2 % host CPU (max 1.5 %), with load1 at most 0.11 ([pre-run state](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.baseline-pre.txt)).
+| Window (UTC, 2026-10-24) | Samples | Host CPU busy, mean / max |
+| --- | --- | --- |
+| Pre-run baseline, 00:14:41–00:15:55 | 75 | 0.2 / 1.5 % |
+| Six gates, 00:16:08–00:23:57 | 466 | 51.1 / 63.2 % |
+| Speed repeat, 00:23:58–00:27:57 | 238 | 50.6 / 52.6 % |
 
-| Phase (UTC) | Host CPU mean / max | Own processes | Everything else, mean / max |
-| --- | --- | --- | --- |
-| Six gates (466 s, to 00:23:57) | 51.1 / 63.2 % | 50.2 % | 0.9 / 13.0 % |
-| Speed repeat (238 s, to 00:27:57) | 50.6 / 52.6 % | 50.4 % | 0.2 / 2.4 % |
+The baseline was taken on AC power with the default governor, with load1 at most 0.11 ([pre-run state](../../lab-runs/20261024T0016-x86-64-avx2-cpu-i5-10210u-e2e.baseline-pre.txt)). During the run, free memory stayed at or above 19.68 GB and swap held at its 0.042 GB baseline.
 
-About 50 % of the host is four of the eight hardware threads, which is this launch's thread count. Nothing outside the run reached 30 % in any second. Free memory stayed at or above 19.68 GB, and swap held at its 0.042 GB baseline. These are host-interval figures; per-core frequency and temperature were not recorded.
+These are whole-host figures, and the run's own share is not separated from other work. The raw logs also hold an `own_cpu_pct` column, but the logger divides by a nominal one-second interval instead of the measured one, so that column is not used for any claim here. Per-core frequency and temperature were not recorded.
 
 ## Exact inputs and evidence
 
