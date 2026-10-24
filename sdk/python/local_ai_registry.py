@@ -117,7 +117,7 @@ def _check_host(l):
             _ok(all(_is(_RT_REL, f) for f in (fs if isinstance(fs, list) else [fs])), "hub weights files")
     rt = l.get("runtime")
     if rt is None:
-        return
+        return _check_paths(l)
     _ok(isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages"} and not l.get("pip"), "runtime keys")
     if "archive" in rt:
         a = rt["archive"]
@@ -147,6 +147,31 @@ def _check_host(l):
             "weights with a runtime need hub layout and a pinned huggingface_hub wheel")
     if l.get("config"):
         _ok(_is(_RT_REL, l["config"].get("at")), "launcher path")
+    _check_paths(l)
+
+
+def _owned(l):
+    """What the setup steps publish besides the archive's entries: packages target and dir, host hub caches, launcher."""
+    pk = (l.get("runtime") or {}).get("packages") or {}
+    return ([("packages.target", pk["target"]), ("packages.dir", pk["dir"])] if pk else []) + \
+        [("weights.at", w["at"]) for w in _weights(l) if w.get("layout") == "hub"] + \
+        ([("launcher", l["config"]["at"])] if l.get("config") and (l.get("runtime") or any(w.get("layout") == "hub" for w in _weights(l))) else [])
+
+
+def _check_paths(l):
+    """No step may publish over another's output: no two destinations equal or nest (hub caches may be shared), none is or
+    holds runtime.archive.into, and none lies in the archive entry that holds the interpreter."""
+    owned = _owned(l)
+    for i, (na, a) in enumerate(owned):
+        for nb, b in owned[i + 1:]:
+            _ok(na == nb == "weights.at" or not _nested(a, b), f"{na} {a} and {nb} {b} overlap")
+    a = (l.get("runtime") or {}).get("archive")
+    if a:
+        py = l["runtime"].get("python")
+        entry = a["into"] + "/" + py[len(a["into"]) + 1:].split("/")[0] if py else None
+        for n, x in owned:
+            _ok(not (x == a["into"] or a["into"].startswith(x + "/")), f"{n} {x} would replace runtime.archive.into")
+            _ok(not entry or not _nested(x, entry), f"{n} {x} overlaps the interpreter's archive entry {entry}")
 
 
 def _nested(a, b):
@@ -161,6 +186,10 @@ def _weights(l):
 _NOLINK = ('nolink() { for p; do if [ -L "$p" ]; then echo "local-ai: $p is a symlink; refusing to write through it" >&2; exit 1; fi; done; }')
 _HUB = ("import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download; "
         "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None)")
+
+
+_KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }'
+_CLEAN = "trap 'if [ -n \"$t\" ]; then rm -f \"$t\"; fi' EXIT"
 
 
 def _prefixes(path):
@@ -178,13 +207,15 @@ def _strict(lines):
     return "(\nset -e\n" + "\n".join(lines) + "\n)"
 
 
-def _runtime_steps(rt):
+def _runtime_steps(l):
     """The pinned interpreter archive, then the hash-locked offline wheel install. Each is staged in a fresh directory
-    beside its destination, checked, and only then published by rename, never through a symlink."""
-    out = []
+    beside its destination and checked in full (hashes, entry names, links, the interpreter) before anything live is
+    touched; it is then published by rename, and a failed rename puts back everything it had moved."""
+    rt, out = l["runtime"], []
     if "archive" in rt:
         a, into = rt["archive"], rt["archive"]["into"]
         f, d = _url_file(a["url"]), _q(into)
+        keep = [x for _, x in _owned(l) if x.startswith(into + "/")]
         out.append({"title": "Install the runtime", "code": _strict([
             _NOLINK,
             f"nolink {_prefixes(into)}",
@@ -193,38 +224,65 @@ def _runtime_steps(rt):
             "trap 'rm -rf \"$s\"' EXIT",
             f'curl -fL -o "$s"/{_q(f)} {_q(a["url"])}',
             f"(cd \"$s\" && echo '{a['sha256']}  {f}' | shasum -a 256 -c -)",
-            'mkdir "$s/x"',
+            'mkdir "$s/x" "$s/old"',
             f'tar -xzf "$s"/{_q(f)} -C "$s/x"',
             'test -n "$(ls -A "$s/x")"',
             'for n in $(ls -A "$s/x"); do',
             '  case $n in .local-ai-*|*[!A-Za-z0-9._+-]*) echo "local-ai: unexpected archive entry $n" >&2; exit 1;; esac',
             f'  nolink {d}/"$n"',
-            f'  if [ -e {d}/"$n" ]; then mv {d}/"$n" "$s/old-$n"; fi',
-            f'  mv "$s/x/$n" {d}/"$n"',
+            *[f'  case {_q(x + "/")} in {d}/"$n"/*) echo "local-ai: archive entry $n would replace {x}" >&2; exit 1;; esac' for x in keep],
             "done",
-            *([f"test -x {_q('./' + rt['python'])}"] if rt.get("python") else [])])})
+            *([f'"$s"/x/{_q(rt["python"][len(into) + 1:])} -I -c pass'] if rt.get("python") else []),
+            _KEEP,
+            'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; '
+            f'for n in $placed; do rm -rf {d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf {d}/"$n"; mv "$s/old/$n" {d}/"$n" || keep "$s/old"; done; exit 1; }}',
+            "placed=",
+            'for n in $(ls -A "$s/x"); do',
+            f'  if [ -e {d}/"$n" ]; then mv {d}/"$n" "$s/old/$n" || undo; fi',
+            f'  mv "$s/x/$n" {d}/"$n" || undo',
+            '  placed="$placed $n"',
+            "done"])})
     if "packages" in rt:
         pk = rt["packages"]
-        d, t = pk["dir"], pk["target"]
+        d, t = _q(pk["dir"]), _q(pk["target"])
         files = [_url_file(w["url"]) for w in pk["wheels"]]
         out.append({"title": "Install the packages", "code": _strict([
             _NOLINK,
-            f"nolink {_prefixes(d)} {_prefixes(t)}",
-            f"mkdir -p {_q(_parent(d))} {_q(_parent(t))}",
-            f"w=$(mktemp -d {_q(_parent(d))}/.local-ai-wheels.XXXXXX)",
-            f"s=$(mktemp -d {_q(_parent(t))}/.local-ai-packages.XXXXXX)",
-            "trap 'rm -rf \"$w\" \"$w.old\" \"$s\"' EXIT",
+            f"nolink {_prefixes(pk['dir'])} {_prefixes(pk['target'])}",
+            f"mkdir -p {_q(_parent(pk['dir']))} {_q(_parent(pk['target']))}",
+            f"w=$(mktemp -d {_q(_parent(pk['dir']))}/.local-ai-wheels.XXXXXX)",
+            f"o=$(mktemp -d {_q(_parent(pk['dir']))}/.local-ai-old.XXXXXX)",
+            f"s=$(mktemp -d {_q(_parent(pk['target']))}/.local-ai-packages.XXXXXX)",
+            "trap 'rm -rf \"$w\" \"$o\" \"$s\"' EXIT",
             *[f'curl -fL -o "$w"/{_q(f)} {_q(w["url"])}' for w, f in zip(pk["wheels"], files)],
             "printf '%s\\n' " + " ".join(_q(f"{w['sha256']}  {f}") for w, f in zip(pk["wheels"], files)) + ' > "$w/SHA256SUMS"',
             '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
             "printf '%s\\n' " + " ".join(_q(f"{w['name']}=={w['version']} --hash=sha256:{w['sha256']}") for w in pk["wheels"]) + ' > "$w/requirements.lock.txt"',
             f"{_q('./' + rt['python'])} -I -m pip --isolated install --no-index --find-links \"$w\" --only-binary :all: --require-hashes "
             '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --disable-pip-version-check',
-            f'if [ -e {_q(t)} ]; then mv {_q(t)} "$s/old"; fi',
-            f'mv "$s/t" {_q(t)}',
-            f'if [ -e {_q(d)} ]; then mv {_q(d)} "$w.old"; fi',
-            f'mv "$w" {_q(d)}'])})
+            f"nolink {t} {d}",
+            _KEEP,
+            'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; '
+            f'if [ -e "$s/old" ]; then rm -rf {t}; mv "$s/old" {t} || keep "$s/old"; elif [ ! -e "$s/t" ]; then rm -rf {t}; fi; '
+            f'if [ -e "$o/old" ]; then rm -rf {d}; mv "$o/old" {d} || keep "$o/old"; elif [ ! -e "$w" ]; then rm -rf {d}; fi; exit 1; }}',
+            f'if [ -e {t} ]; then mv {t} "$s/old" || undo; fi',
+            f'mv "$s/t" {t} || undo',
+            f'if [ -e {d} ]; then mv {d} "$o/old" || undo; fi',
+            f'mv "$w" {d} || undo'])})
     return out
+
+
+def _write(path, body):
+    """Write a file through an exclusive temp file in its (checked) directory, renamed over `path` only if `path` is
+    neither a link nor a directory; the temp file is a fresh regular file that no one else could have created."""
+    return [f"t=$(mktemp {_q(_parent(path))}/.local-ai-tmp.XXXXXX)",
+            'test -f "$t"',
+            'test ! -L "$t"',
+            *body('"$t"'),
+            'chmod 644 "$t"',
+            f"nolink {_q(path)}",
+            f"if [ -d {_q(path)} ]; then echo \"local-ai: {path} is a directory\" >&2; exit 1; fi",
+            f'mv -f "$t" {_q(path)}']
 
 
 def _host_download(w, rt=None):
@@ -244,8 +302,8 @@ def _host_download(w, rt=None):
         get = f"hf download {w['repo']}{_files(w)} --revision {rev} --cache-dir {_q(at)}"
     lines = [f"nolink {_prefixes(at)} {owned}", f"mkdir -p {_q(at)}", get, f"nolink {owned}", f"test -d {_q(f'{m}/snapshots/{rev}')}"]
     if w.get("ref"):
-        lines += [f"mkdir -p {_q(m + '/refs')}", f"printf '%s' {rev} > {_q(m + '/refs/.local-ai-' + w['ref'])}",
-                  f"mv {_q(m + '/refs/.local-ai-' + w['ref'])} {_q(m + '/refs/' + w['ref'])}"]
+        lines += [f"mkdir -p {_q(m + '/refs')}", f"nolink {_q(m + '/refs')}",
+                  *_write(f"{m}/refs/{w['ref']}", lambda t: [f"printf '%s' {rev} > {t}"])]
     return lines
 
 
@@ -257,7 +315,7 @@ def _host_steps(l):
     env = [f"{k}={_value(v)}" for k, v in (l.get("env") or {}).items()]
     rt = l.get("runtime")
     if rt:
-        out = _runtime_steps(rt)
+        out = _runtime_steps(l)
     else:
         if not l.get("pip") and not l.get("weights"):
             return [{"title": "Install", "code": _install(l["install"])}, {"title": "Start the server", "code": " ".join(env + [_q(c) for c in l["command"]])}]
@@ -266,14 +324,14 @@ def _host_steps(l):
             out.append({"title": "Install the native engine", "code": _install(l["install"])})
     if l.get("weights"):
         if any(w.get("layout") == "hub" for w in l["weights"]):  # a cache: checked, confined and stopped at its first failure
-            out.append({"title": "Download the weights", "code": _strict([_NOLINK, *[x for w in l["weights"] for x in _host_download(w, rt)]])})
+            out.append({"title": "Download the weights", "code": _strict([_NOLINK, "t=", _CLEAN, *[x for w in l["weights"] for x in _host_download(w, rt)]])})
         else:
             out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
     if l.get("config"):
         at = l["config"]["at"]
         if rt:
-            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
-                                                                         f"cat > {_q(at)} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])})
+            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, "t=", _CLEAN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
+                                                                         *_write(at, lambda t: [f"cat > {t} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])])})
         else:
             mk = f"mkdir -p {at.rsplit('/', 1)[0]}\n" if "/" in at else ""
             out.append({"title": "Write the launcher", "code": f"{mk}cat > {at} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"})

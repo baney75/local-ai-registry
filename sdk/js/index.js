@@ -76,7 +76,7 @@ function checkHost(l) {
     }
   }
   const rt = l.runtime;
-  if (rt === undefined || rt === null) return;
+  if (rt === undefined || rt === null) return checkPaths(l);
   ok(keys(rt) && Object.keys(rt).length && Object.keys(rt).every((k) => ["archive", "python", "packages"].includes(k)) && !l.pip?.length, "runtime keys");
   if ("archive" in rt) {
     const a = rt.archive;
@@ -104,11 +104,35 @@ function checkHost(l) {
   if (ws.length) ok("packages" in rt && rt.packages.wheels.some((w) => canon(w.name) === "huggingface-hub") && ws[0].layout === "hub",
     "weights with a runtime need hub layout and a pinned huggingface_hub wheel");
   if (l.config) ok(is(RT.rel, l.config.at), "launcher path");
+  checkPaths(l);
+}
+
+/** What the setup steps publish besides the archive's entries: packages target and dir, host hub caches, launcher. */
+function owned(l) {
+  const pk = l.runtime?.packages, hub = weights(l).filter((w) => w.layout === "hub");
+  return [...(pk ? [["packages.target", pk.target], ["packages.dir", pk.dir]] : []), ...hub.map((w) => ["weights.at", w.at]),
+    ...(l.config && (l.runtime || hub.length) ? [["launcher", l.config.at]] : [])];
+}
+/** No step may publish over another's output: no two destinations equal or nest (hub caches may be shared), none is or
+ *  holds runtime.archive.into, and none lies in the archive entry that holds the interpreter. */
+function checkPaths(l) {
+  const own = owned(l);
+  own.forEach(([na, a], i) => own.slice(i + 1).forEach(([nb, b]) => ok((na === "weights.at" && nb === "weights.at") || !nested(a, b), `${na} ${a} and ${nb} ${b} overlap`)));
+  const a = l.runtime?.archive;
+  if (a) {
+    const py = l.runtime.python, entry = py ? `${a.into}/${py.slice(a.into.length + 1).split("/")[0]}` : null;
+    for (const [n, x] of own) {
+      ok(!(x === a.into || a.into.startsWith(`${x}/`)), `${n} ${x} would replace runtime.archive.into`);
+      ok(!entry || !nested(x, entry), `${n} ${x} overlaps the interpreter's archive entry ${entry}`);
+    }
+  }
 }
 
 const NOLINK = 'nolink() { for p; do if [ -L "$p" ]; then echo "local-ai: $p is a symlink; refusing to write through it" >&2; exit 1; fi; done; }';
 const HUB = "import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download; " +
   "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None)";
+const KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }';
+const CLEAN = `trap 'if [ -n "$t" ]; then rm -f "$t"; fi' EXIT`;
 /** `a/b/c` -> `a a/b a/b/c`: every directory a write to `path` passes through, quoted. */
 const prefixes = (path) => path.split("/").map((_, i, p) => q(p.slice(0, i + 1).join("/"))).join(" ");
 const parent = (path) => (path.includes("/") ? path.replace(/\/[^/]*$/, "") : ".");
@@ -116,52 +140,73 @@ const parent = (path) => (path.includes("/") ? path.replace(/\/[^/]*$/, "") : ".
 const strict = (lines) => `(\nset -e\n${lines.join("\n")}\n)`;
 
 /** The pinned interpreter archive, then the hash-locked offline wheel install. Each is staged in a fresh directory
- *  beside its destination, checked, and only then published by rename, never through a symlink. */
-function runtimeSteps(rt) {
-  const out = [];
+ *  beside its destination and checked in full (hashes, entry names, links, the interpreter) before anything live is
+ *  touched; it is then published by rename, and a failed rename puts back everything it had moved. */
+function runtimeSteps(l) {
+  const rt = l.runtime, out = [];
   if (rt.archive) {
-    const a = rt.archive, f = urlFile(a.url), d = q(a.into);
+    const a = rt.archive, into = a.into, f = urlFile(a.url), d = q(into);
+    const keep = owned(l).map(([, x]) => x).filter((x) => x.startsWith(`${into}/`));
     out.push({ title: "Install the runtime", code: strict([
       NOLINK,
-      `nolink ${prefixes(a.into)}`,
+      `nolink ${prefixes(into)}`,
       `mkdir -p ${d}`,
       `s=$(mktemp -d ${d}/.local-ai-runtime.XXXXXX)`,
       `trap 'rm -rf "$s"' EXIT`,
       `curl -fL -o "$s"/${q(f)} ${q(a.url)}`,
       `(cd "$s" && echo '${a.sha256}  ${f}' | shasum -a 256 -c -)`,
-      'mkdir "$s/x"',
+      'mkdir "$s/x" "$s/old"',
       `tar -xzf "$s"/${q(f)} -C "$s/x"`,
       'test -n "$(ls -A "$s/x")"',
       'for n in $(ls -A "$s/x"); do',
       '  case $n in .local-ai-*|*[!A-Za-z0-9._+-]*) echo "local-ai: unexpected archive entry $n" >&2; exit 1;; esac',
       `  nolink ${d}/"$n"`,
-      `  if [ -e ${d}/"$n" ]; then mv ${d}/"$n" "$s/old-$n"; fi`,
-      `  mv "$s/x/$n" ${d}/"$n"`,
+      ...keep.map((x) => `  case ${q(`${x}/`)} in ${d}/"$n"/*) echo "local-ai: archive entry $n would replace ${x}" >&2; exit 1;; esac`),
       "done",
-      ...(rt.python ? [`test -x ${q(`./${rt.python}`)}`] : [])]) });
+      ...(rt.python ? [`"$s"/x/${q(rt.python.slice(into.length + 1))} -I -c pass`] : []),
+      KEEP,
+      'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; ' +
+      `for n in $placed; do rm -rf ${d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf ${d}/"$n"; mv "$s/old/$n" ${d}/"$n" || keep "$s/old"; done; exit 1; }`,
+      "placed=",
+      'for n in $(ls -A "$s/x"); do',
+      `  if [ -e ${d}/"$n" ]; then mv ${d}/"$n" "$s/old/$n" || undo; fi`,
+      `  mv "$s/x/$n" ${d}/"$n" || undo`,
+      '  placed="$placed $n"',
+      "done"]) });
   }
   if (rt.packages) {
-    const pk = rt.packages, d = pk.dir, t = pk.target, fs = pk.wheels.map((w) => urlFile(w.url));
+    const pk = rt.packages, d = q(pk.dir), t = q(pk.target), fs = pk.wheels.map((w) => urlFile(w.url));
     out.push({ title: "Install the packages", code: strict([
       NOLINK,
-      `nolink ${prefixes(d)} ${prefixes(t)}`,
-      `mkdir -p ${q(parent(d))} ${q(parent(t))}`,
-      `w=$(mktemp -d ${q(parent(d))}/.local-ai-wheels.XXXXXX)`,
-      `s=$(mktemp -d ${q(parent(t))}/.local-ai-packages.XXXXXX)`,
-      `trap 'rm -rf "$w" "$w.old" "$s"' EXIT`,
+      `nolink ${prefixes(pk.dir)} ${prefixes(pk.target)}`,
+      `mkdir -p ${q(parent(pk.dir))} ${q(parent(pk.target))}`,
+      `w=$(mktemp -d ${q(parent(pk.dir))}/.local-ai-wheels.XXXXXX)`,
+      `o=$(mktemp -d ${q(parent(pk.dir))}/.local-ai-old.XXXXXX)`,
+      `s=$(mktemp -d ${q(parent(pk.target))}/.local-ai-packages.XXXXXX)`,
+      `trap 'rm -rf "$w" "$o" "$s"' EXIT`,
       ...pk.wheels.map((w, i) => `curl -fL -o "$w"/${q(fs[i])} ${q(w.url)}`),
       `printf '%s\\n' ${pk.wheels.map((w, i) => q(`${w.sha256}  ${fs[i]}`)).join(" ")} > "$w/SHA256SUMS"`,
       '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
       `printf '%s\\n' ${pk.wheels.map((w) => q(`${w.name}==${w.version} --hash=sha256:${w.sha256}`)).join(" ")} > "$w/requirements.lock.txt"`,
       `${q(`./${rt.python}`)} -I -m pip --isolated install --no-index --find-links "$w" --only-binary :all: --require-hashes ` +
       '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --disable-pip-version-check',
-      `if [ -e ${q(t)} ]; then mv ${q(t)} "$s/old"; fi`,
-      `mv "$s/t" ${q(t)}`,
-      `if [ -e ${q(d)} ]; then mv ${q(d)} "$w.old"; fi`,
-      `mv "$w" ${q(d)}`]) });
+      `nolink ${t} ${d}`,
+      KEEP,
+      'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; ' +
+      `if [ -e "$s/old" ]; then rm -rf ${t}; mv "$s/old" ${t} || keep "$s/old"; elif [ ! -e "$s/t" ]; then rm -rf ${t}; fi; ` +
+      `if [ -e "$o/old" ]; then rm -rf ${d}; mv "$o/old" ${d} || keep "$o/old"; elif [ ! -e "$w" ]; then rm -rf ${d}; fi; exit 1; }`,
+      `if [ -e ${t} ]; then mv ${t} "$s/old" || undo; fi`,
+      `mv "$s/t" ${t} || undo`,
+      `if [ -e ${d} ]; then mv ${d} "$o/old" || undo; fi`,
+      `mv "$w" ${d} || undo`]) });
   }
   return out;
 }
+
+/** Write a file through an exclusive temp file in its (checked) directory, renamed over `path` only if `path` is
+ *  neither a link nor a directory; the temp file is a fresh regular file that no one else could have created. */
+const write = (path, body) => [`t=$(mktemp ${q(parent(path))}/.local-ai-tmp.XXXXXX)`, 'test -f "$t"', 'test ! -L "$t"', ...body('"$t"'),
+  'chmod 644 "$t"', `nolink ${q(path)}`, `if [ -d ${q(path)} ]; then echo "local-ai: ${path} is a directory" >&2; exit 1; fi`, `mv -f "$t" ${q(path)}`];
 
 /** Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub) whose pinned snapshot must exist and,
  *  with `ref`, whose task-local refs/<ref> then names that revision. With a pinned runtime the download runs on its own
@@ -169,13 +214,12 @@ function runtimeSteps(rt) {
 function hostDownload(w, rt) {
   if (w.layout !== "hub") return `hf download ${w.repo}${files(w)} \\\n  --revision ${w.revision} \\\n  --local-dir ${w.at}`;
   const at = w.at, rev = w.revision, m = `${at}/models--${w.repo.replace("/", "--")}`;
-  const owned = [m, `${m}/snapshots`, `${m}/snapshots/${rev}`, `${m}/refs`, ...(w.ref ? [`${m}/refs/${w.ref}`] : [])].map(q).join(" ");
+  const own = [m, `${m}/snapshots`, `${m}/snapshots/${rev}`, `${m}/refs`, ...(w.ref ? [`${m}/refs/${w.ref}`] : [])].map(q).join(" ");
   const fs = Array.isArray(w.files) ? w.files : w.files ? [w.files] : [];
   const get = rt ? `${q(`./${rt.python}`)} -I -c ${q(HUB)} ${q(rt.packages.target)} ${w.repo} ${rev} ${q(at)}${fs.map((f) => ` ${q(f)}`).join("")}`
     : `hf download ${w.repo}${files(w)} --revision ${rev} --cache-dir ${q(at)}`;
-  const lines = [`nolink ${prefixes(at)} ${owned}`, `mkdir -p ${q(at)}`, get, `nolink ${owned}`, `test -d ${q(`${m}/snapshots/${rev}`)}`];
-  if (w.ref) lines.push(`mkdir -p ${q(`${m}/refs`)}`, `printf '%s' ${rev} > ${q(`${m}/refs/.local-ai-${w.ref}`)}`,
-    `mv ${q(`${m}/refs/.local-ai-${w.ref}`)} ${q(`${m}/refs/${w.ref}`)}`);
+  const lines = [`nolink ${prefixes(at)} ${own}`, `mkdir -p ${q(at)}`, get, `nolink ${own}`, `test -d ${q(`${m}/snapshots/${rev}`)}`];
+  if (w.ref) lines.push(`mkdir -p ${q(`${m}/refs`)}`, `nolink ${q(`${m}/refs`)}`, ...write(`${m}/refs/${w.ref}`, (t) => [`printf '%s' ${rev} > ${t}`]));
   return lines;
 }
 
@@ -187,19 +231,20 @@ function hostSteps(l) {
   const env = Object.entries(l.env ?? {}).map(([k, v]) => `${k}=${value(v)}`);
   const rt = l.runtime;
   let out;
-  if (rt) out = runtimeSteps(rt);
+  if (rt) out = runtimeSteps(l);
   else {
     if (!l.pip && !l.weights?.length) return [{ title: "Install", code: install(l.install) }, { title: "Start the server", code: [...env, ...l.command.map(q)].join(" ") }];
     out = [l.pip ? { title: "Install the engine", code: `python3 -m pip install ${l.pip.map(q).join(" ")}` } : { title: "Install the engine", code: install(l.install) }];
     if (l.pip && /^https:\/\/\S+\.tar\.gz#sha256=[0-9a-f]{64}$/.test(l.install ?? "")) out.push({ title: "Install the native engine", code: install(l.install) });
   }
   if (l.weights?.length) {
-    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
+    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, "t=", CLEAN, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
     else out.push({ title: "Download the weights", code: l.weights.map((w) => hostDownload(w)).join("\n\n") });
   }
   if (l.config) {
     const at = l.config.at;
-    if (rt) out.push({ title: "Write the launcher", code: strict([NOLINK, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`, `cat > ${q(at)} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`]) });
+    if (rt) out.push({ title: "Write the launcher", code: strict([NOLINK, "t=", CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
+      ...write(at, (t) => [`cat > ${t} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`])]) });
     else out.push({ title: "Write the launcher", code: `${at.includes("/") ? `mkdir -p ${at.replace(/\/[^/]*$/, "")}\n` : ""}cat > ${at} <<'EOF'\n${l.config.text.trimEnd()}\nEOF` });
   }
   if (l.sysctl) out.push({ title: "Raise the GPU memory limit (resets on reboot)", code: Object.entries(l.sysctl).map(([k, v]) => `sudo sysctl ${k}=${v}`).join("\n") });

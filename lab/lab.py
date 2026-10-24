@@ -677,6 +677,8 @@ def check_host_runtime(launch):
             assert all(isinstance(f, str) and re.fullmatch(RT_REL, f) for f in fs), "hub weights files"
     rt = launch.get("runtime")
     if rt is None:
+        if kind == "host":
+            check_host_paths(launch)
         return
     assert kind == "host", "runtime is for host launches"
     assert isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages"}, f"runtime keys {sorted(rt) if isinstance(rt, dict) else rt}"
@@ -719,6 +721,32 @@ def check_host_runtime(launch):
             "weights with a runtime need a pinned huggingface_hub wheel in runtime.packages"
     if launch.get("config"):
         assert isinstance(launch["config"].get("at"), str) and re.fullmatch(RT_REL, launch["config"]["at"]), "launcher path"
+    check_host_paths(launch)
+
+
+def _overlap(a, b):
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def check_host_paths(launch):
+    """No setup step may publish over another's output: packages target and dir, host hub caches (which weights may
+    share) and the launcher never equal or nest, none is or holds runtime.archive.into, and none lies in the archive
+    entry that holds the interpreter (the runtime step replaces whole entries)."""
+    weights = launch.get("weights") or []
+    hub = [w["at"] for w in (weights if isinstance(weights, list) else [weights]) if w and w.get("repo") and w.get("layout") == "hub"]
+    rt = launch.get("runtime") or {}
+    pk = rt.get("packages") or {}
+    owned = ([("packages.target", pk["target"]), ("packages.dir", pk["dir"])] if pk else []) + [("weights.at", a) for a in hub] + \
+        ([("launcher", launch["config"]["at"])] if launch.get("config") and (rt or hub) else [])
+    for i, (na, a) in enumerate(owned):
+        for nb, b in owned[i + 1:]:
+            assert na == nb == "weights.at" or not _overlap(a, b), f"{na} {a} and {nb} {b} overlap"
+    if rt.get("archive"):
+        into, py = rt["archive"]["into"], rt.get("python")
+        entry = into + "/" + py[len(into) + 1:].split("/")[0] if py else None
+        for n, x in owned:
+            assert not (x == into or into.startswith(x + "/")), f"{n} {x} would replace runtime.archive.into"
+            assert not entry or not _overlap(x, entry), f"{n} {x} overlaps the interpreter's archive entry {entry}"
 
 
 def check_needs(n):

@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -162,6 +163,63 @@ BAD = {
     'hub repo has ;': edit(['weights', 0, 'repo'], 'org/model;id'),
     'hub files climb': edit(['weights', 0, 'files'], ['../config.json']),
 }
+
+
+
+def paths(root='rt', runtime=True, **kv):
+    """The fixture with some destinations moved: target, dir, at (every hub cache) or config (the launcher)."""
+    def make():
+        L = launch(root=root)
+        if not runtime:
+            del L['runtime']
+        for k, v in kv.items():
+            if k in ('target', 'dir'):
+                L['runtime']['packages'][k] = v
+            elif k == 'at':
+                for w in L['weights']:
+                    w['at'] = v
+            else:
+                L['config']['at'] = v
+        return L
+    return make
+
+
+# Destinations that collide (equal, or one inside the other, both ways); with root 'rt' the interpreter's archive entry is
+# rt/python, and 'opt/rt' lets a destination hold runtime.archive.into.
+COLLIDE = {
+    'target is into (dir elsewhere)': paths(dir='wheels', target='rt'),
+    'target holds into': paths('opt/rt', target='opt', dir='w/wheels'),
+    'target is the interpreter entry': paths(target='rt/python'),
+    'target inside the interpreter entry': paths(target='rt/python/site'),
+    'dir is into': paths(dir='rt', target='site'),
+    'dir holds into': paths('opt/rt', dir='opt', target='s/site'),
+    'dir is the interpreter entry': paths(dir='rt/python'),
+    'dir inside the interpreter entry': paths(dir='rt/python/wheels'),
+    'cache is into': paths(at='rt'),
+    'cache holds into': paths('opt/rt', at='opt'),
+    'cache is the interpreter entry': paths(at='rt/python'),
+    'cache inside the interpreter entry': paths(at='rt/python/hf'),
+    'launcher is into': paths(config='rt'),
+    'launcher holds into': paths('opt/rt', config='opt'),
+    'launcher inside the interpreter entry': paths(config='rt/python/serve.py'),
+    'target is cache': paths(at='rt/site'),
+    'cache inside target': paths(at='rt/site/hf'),
+    'target inside cache': paths(target='rt/hf-cache/site'),
+    'dir is cache': paths(at='rt/wheels'),
+    'cache inside dir': paths(at='rt/wheels/hf'),
+    'dir inside cache': paths(dir='rt/hf-cache/wheels'),
+    'launcher is target': paths(config='rt/site'),
+    'launcher inside target': paths(config='rt/site/serve.py'),
+    'target inside launcher': paths(target='launcher/serve.py/site'),
+    'launcher is dir': paths(config='rt/wheels'),
+    'launcher inside dir': paths(config='rt/wheels/serve.py'),
+    'dir inside launcher': paths(dir='launcher/serve.py/wheels'),
+    'launcher is cache': paths(config='rt/hf-cache'),
+    'launcher inside cache': paths(config='rt/hf-cache/serve.py'),
+    'cache inside launcher': paths(at='launcher/serve.py/hf'),
+    'launcher inside cache, no runtime': paths(runtime=False, config='rt/hf-cache/serve.py'),
+}
+BAD.update({f'collision: {k}': v for k, v in COLLIDE.items()})
 
 # Rejected by lab.py check; the SDKs never render these fields for a container, so there is nothing to refuse there.
 BAD_LAB = {
@@ -328,9 +386,19 @@ def snapshot_download(repo_id, revision=None, cache_dir=None, allow_patterns=Non
     open("HUB_USED", "w").write(os.path.abspath(__file__))
     if os.environ.get("FAKE_HF_MISS"):
         return cache_dir
-    snap = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"), "snapshots", revision)
+    m = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"))
+    snap = os.path.join(m, "snapshots", revision)
     os.makedirs(snap, exist_ok=True)
     open(os.path.join(snap, "config.json"), "w").write("{}")
+    # a hostile cache, changed while the download ran: refs a link out, refs/main a link out, or refs/main a directory
+    hostile, out = os.environ.get("FAKE_HF_HOSTILE"), os.environ.get("FAKE_OUTSIDE")
+    if hostile == "refs":
+        os.symlink(out, os.path.join(m, "refs"))
+    elif hostile == "ref":
+        os.makedirs(os.path.join(m, "refs"), exist_ok=True)
+        os.symlink(os.path.join(out, "victim"), os.path.join(m, "refs", "main"))
+    elif hostile == "refdir":
+        os.makedirs(os.path.join(m, "refs", "main"), exist_ok=True)
     return snap
 '''
 FAKE_CURL = '''#!/bin/sh
@@ -340,6 +408,18 @@ while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1;
 name=$(printf '%s' "${url##*/}" | sed 's/%2B/+/g')
 [ -f "$FAKE_SERVER/$name" ] || exit 22
 cp "$FAKE_SERVER/$name" "$out"
+'''
+# mv, except that a publish onto $FAIL_MV_TO (a move out of a .local-ai- staging dir) fails, to exercise the rollback, and
+# with $FAIL_RESTORE the restore of the previous copy (a move out of .../old) fails too
+FAKE_MV = '''#!/bin/sh
+for last; do :; done
+if [ -n "$FAIL_MV_TO" ] && [ "$last" = "$FAIL_MV_TO" ]; then
+  case "$1" in
+    */old|*/old/*) if [ -n "$FAIL_RESTORE" ]; then echo "mv: injected restore failure" >&2; exit 1; fi;;
+    *.local-ai-*) echo "mv: injected failure" >&2; exit 1;;
+  esac
+fi
+exec /bin/mv "$@"
 '''
 # Anything looked up on PATH or planted in the working directory instead of the pinned runtime: record it and fail.
 TRAP = '#!/bin/sh\necho "$0 $*" >> "$TRAPPED"\nexit 73\n'
@@ -372,6 +452,7 @@ class SandboxTest(unittest.TestCase):
             p.mkdir()
         (self.outside / 'victim').write_text('untouched\n')
         (self.bin / 'curl').write_text(FAKE_CURL)
+        (self.bin / 'mv').write_text(FAKE_MV)
         for name in ('hf', 'python3', 'python', 'pip', 'pip3', 'huggingface-cli'):
             (self.bin / name).write_text(TRAP)
         for f in self.bin.iterdir():
@@ -400,7 +481,7 @@ class SandboxTest(unittest.TestCase):
     def sh(self, code, work, shell=('sh', '-c'), **env):
         return subprocess.run([*shell, code], cwd=work, capture_output=True, text=True,
                               env={'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_SERVER': str(self.server), 'HOME': str(work),
-                                   'TRAPPED': str(work / 'TRAPPED'), **env})
+                                   'TRAPPED': str(work / 'TRAPPED'), 'FAKE_OUTSIDE': str(self.outside), **env})
 
     def step(self, L, title, work, sdk_name='python', **env):
         code = next(s['code'] for s in renderings(L)[sdk_name] if s['title'] == title)
@@ -551,6 +632,100 @@ class SandboxTest(unittest.TestCase):
         r = self.step(self.L(), 'Download the weights', w, PATH='/usr/bin:/bin')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((w / 'rt/hf-cache/models--org--model/refs/main').read_text(), REV)
+
+    # r2: the ref is written through an exclusive temp file; links and directories at refs paths are refused
+
+    def test_planted_fixed_temp_link_is_never_written(self):
+        m = 'rt/hf-cache/models--org--model/refs'
+        for name in renderings(self.L()):
+            w = self.work(); self.install(w)
+            (w / m).mkdir(parents=True)
+            (w / m / '.local-ai-main').symlink_to(self.outside / 'victim')
+            r = self.step(self.L(), 'Download the weights', w, name)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            self.assertEqual((self.outside / 'victim').read_text(), 'untouched\n', name)
+            self.assertFalse((w / m / 'main').is_symlink(), name)
+            self.assertEqual((w / m / 'main').read_text(), REV, name)
+            self.assertEqual([f for f in staging_left(w) if not f.endswith('.local-ai-main')], [], name)
+
+    def test_hostile_cache_during_download(self):
+        for hostile in ('refs', 'ref', 'refdir'):
+            for name in renderings(self.L()):
+                w = self.work(); self.install(w)
+                was = tree(self.outside)
+                r = self.step(self.L(), 'Download the weights', w, name, FAKE_HF_HOSTILE=hostile)
+                self.assertNotEqual(r.returncode, 0, (hostile, name))
+                self.assertEqual(tree(self.outside), was, (hostile, name))
+                self.assertEqual(staging_left(w), [], (hostile, name))
+
+    def test_launcher_over_a_directory_is_refused(self):
+        for name in renderings(self.L()):
+            w = self.work(); (w / 'launcher/serve.py').mkdir(parents=True)
+            r = self.step(self.L(), 'Write the launcher', w, name)
+            self.assertNotEqual(r.returncode, 0, name)
+            self.assertEqual(staging_left(w), [], name)
+
+    # r2: a bad archive or a failed publish leaves the whole previous runtime as it was, and usable
+
+    def archive(self, entries):
+        """Replace the served archive with one holding `entries` ({path: (text, mode)}); returns the launch pinning it."""
+        src = self.d / f'arch{self.n}'; self.n += 1
+        for rel, (text, mode) in entries.items():
+            (src / rel).parent.mkdir(parents=True, exist_ok=True)
+            (src / rel).write_text(text); (src / rel).chmod(mode)
+        subprocess.run(['tar', '-czf', str(self.server / ARCHIVE), '-C', str(src), *sorted({r.split('/')[0] for r in entries})], check=True)
+        return self.L((hashlib.sha256((self.server / ARCHIVE).read_bytes()).hexdigest(),) + self.shas[1:])
+
+    def test_bad_archive_or_failed_publish_keeps_the_runtime(self):
+        base = self.work()
+        for title in ('Install the runtime', 'Install the packages', 'Download the weights', 'Write the launcher'):
+            self.assertEqual(self.step(self.L(), title, base).returncode, 0, title)
+        before_ = tree(base / 'rt')
+        good = (f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755)
+        cases = {  # name: (archive entries, env)
+            'no interpreter': ({'python/lib/x': ('', 0o644)}, {}),
+            'interpreter not executable': ({'python/bin/python3': good[0:1] + (0o644,)}, {}),
+            'interpreter that fails': ({'python/bin/python3': ('#!/bin/sh\nexit 3\n', 0o755)}, {}),
+            'bad entry name': ({'python/bin/python3': good, 'bad name/x': ('', 0o644)}, {}),
+            'reserved entry name': ({'python/bin/python3': good, '.local-ai-x/y': ('', 0o644)}, {}),
+            'entry holds the packages target': ({'python/bin/python3': good, 'site/x': ('', 0o644)}, {}),
+            'entry holds the hub cache': ({'python/bin/python3': good, 'hf-cache/x': ('', 0o644)}, {}),
+            'publish fails after another entry was placed': ({'aaa/x': ('', 0o644), 'python/bin/python3': good}, {'FAIL_MV_TO': 'rt/python'}),
+        }
+        for case, (entries, env) in cases.items():
+            L = self.archive(entries)
+            for name in renderings(L):
+                w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
+                r = self.step(L, 'Install the runtime', w, name, **env)
+                self.assertNotEqual(r.returncode, 0, (case, name))
+                self.assertEqual(tree(w / 'rt'), before_, (case, name))
+                self.assertEqual(staging_left(w), [], (case, name))
+                ok = subprocess.run(['rt/python/bin/python3', '-I', '-c', 'import sys; sys.path.insert(0, "rt/site"); import fixture_a, huggingface_hub'],
+                                    cwd=w, capture_output=True, text=True)
+                self.assertEqual(ok.returncode, 0, (case, name, ok.stderr))
+
+    def test_failed_restore_keeps_the_previous_copy(self):
+        base = self.work(); self.install(base)
+        py = tree(base / 'rt/python')
+        L = self.archive({'python/bin/python3': (f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755), 'zzz/x': ('', 0o644)})
+        for name in renderings(L):
+            w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
+            r = self.step(L, 'Install the runtime', w, name, FAIL_MV_TO='rt/python', FAIL_RESTORE='1')
+            self.assertNotEqual(r.returncode, 0, name)
+            kept = re.search(r'previous copy is kept in (\S+)', r.stderr)
+            self.assertTrue(kept, (name, r.stderr))
+            self.assertEqual(tree(w / kept.group(1) / 'python'), py, name)  # never deleted, so it can be put back by hand
+
+    def test_failed_package_publish_restores_both(self):
+        base = self.work(); self.install(base)
+        site, wheels = tree(base / 'rt/site'), tree(base / 'rt/wheels')
+        for dest in ('rt/site', 'rt/wheels'):
+            for name in renderings(self.L()):
+                w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
+                r = self.step(self.L(), 'Install the packages', w, name, FAIL_MV_TO=dest)
+                self.assertNotEqual(r.returncode, 0, (dest, name))
+                self.assertEqual((tree(w / 'rt/site'), tree(w / 'rt/wheels')), (site, wheels), (dest, name))
+                self.assertEqual(staging_left(w), [], (dest, name))
 
     def test_missing_snapshot_writes_no_ref(self):
         w = self.work(); self.install(w)
