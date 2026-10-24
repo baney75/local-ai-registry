@@ -250,6 +250,12 @@ CACHES = {
     'same repo twice in one cache, no runtime': two_hub({}, {'revision': 'd' * 40}, runtime=False),
 }
 BAD.update({f'cache: {k}': v for k, v in CACHES.items()})
+# r5: a hub launch without a runtime is confined too, so its launcher path is checked like any other
+BAD.update({
+    'hub only: launcher path is absolute': paths(runtime=False, config='/tmp/local-ai-r5/serve.py'),
+    'hub only: launcher path climbs': paths(runtime=False, config='../serve.py'),
+    'hub only: launcher path holds the cache': paths(runtime=False, config='rt'),
+})
 
 # Rejected by lab.py check; the SDKs never render these fields for a container, so there is nothing to refuse there.
 BAD_LAB = {
@@ -526,6 +532,7 @@ class SandboxTest(unittest.TestCase):
         b = make_wheel(self.server, 'fixture-b', '2.0')
         h = make_wheel(self.server, 'huggingface-hub', '1.0', module=HUB)
         self.shas = tuple(hashlib.sha256(f.read_bytes()).hexdigest() for f in (self.server / ARCHIVE, a, b, h))
+        self.archive_bytes = (self.server / ARCHIVE).read_bytes()
         self.n = 0
 
     def tearDown(self):
@@ -867,8 +874,8 @@ class SandboxTest(unittest.TestCase):
 
     # r3: archive members and links are checked before anything runs or is published; safe internal links are kept
 
-    def crafted(self, members):
-        """Serve a .tar.gz holding `members` [(name, kind, value, mode)] and return the launch pinning it."""
+    def crafted(self, members, make=None):
+        """Serve a .tar.gz holding `members` [(name, kind, value, mode)] and return the launch pinning it (`make(shas)`)."""
         f = self.server / ARCHIVE
         with tarfile.open(f, 'w:gz') as t:
             for name, kind, value, mode in members:
@@ -879,7 +886,81 @@ class SandboxTest(unittest.TestCase):
                     i.type = {'sym': tarfile.SYMTYPE, 'hard': tarfile.LNKTYPE, 'fifo': tarfile.FIFOTYPE, 'dir': tarfile.DIRTYPE}[kind]
                     i.linkname = value or ''
                     t.addfile(i)
-        return self.L((hashlib.sha256(f.read_bytes()).hexdigest(),) + self.shas[1:])
+        shas = (hashlib.sha256(f.read_bytes()).hexdigest(),) + self.shas[1:]
+        return make(shas) if make else self.L(shas)
+
+    # r5: an archive entry may not replace another step's output even when the names differ only in case (macOS file
+    # systems ignore case), whether the entry or a parent directory of the destination differs
+
+    def test_archive_entry_never_replaces_output_differing_in_case(self):
+        def variant(target='rt/site', at='rt/hf-cache', config='rt/launcher/serve.py'):
+            def make(shas):
+                L = launch(runtime(shas))
+                L['runtime']['packages']['target'] = target
+                L['env'] = {**L['env'], 'PYTHONPATH': target}
+                for w in L['weights']:
+                    w['at'] = at
+                L['config']['at'] = config
+                return L
+            return make
+        py = ('python/bin/python3', 'file', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755)
+        cases = {  # name: (launch variant, protected dir, archive entry)
+            'entry SITE, target rt/site': (variant(), 'rt/site', 'SITE'),
+            'entry site, target rt/Site': (variant(target='rt/Site'), 'rt/Site', 'site'),
+            'entry HF-CACHE, cache rt/hf-cache': (variant(), 'rt/hf-cache', 'HF-CACHE'),
+            'entry LAUNCHER, launcher in rt/launcher': (variant(), 'rt/launcher', 'LAUNCHER'),
+            'entry site, target under RT/': (variant(target='RT/site'), 'RT/site', 'site'),
+            'entry hf-cache, cache under RT/': (variant(at='RT/hf-cache'), 'RT/hf-cache', 'hf-cache'),
+            'entry launcher, launcher under RT/': (variant(config='RT/launcher/serve.py'), 'RT/launcher', 'launcher'),
+        }
+        for case, (make, protected, entry) in cases.items():
+            for name in ('python', 'js') if NODE else ('python',):
+                with self.subTest(case=case, sdk=name):
+                    (self.server / ARCHIVE).write_bytes(self.archive_bytes)
+                    good = make(self.shas)
+                    w = self.work()
+                    for title in ('Install the runtime', 'Install the packages', 'Download the weights', 'Write the launcher'):
+                        r = self.step(good, title, w, name)
+                        self.assertEqual(r.returncode, 0, (case, name, title, r.stderr[-1500:]))
+                    (w / protected / 'KEEP').write_text('another step made this\n')
+                    was = tree(w)
+                    L = self.crafted([py, (f'{entry}/from-archive', 'file', 'x', 0o644)], make)
+                    r = self.step(L, 'Install the runtime', w, name)
+                    self.assertNotEqual(r.returncode, 0, (case, name))
+                    self.assertIn('would replace', r.stderr, (case, name))
+                    self.assertEqual(tree(w), was, (case, name))
+                    self.assertEqual((w / protected / 'KEEP').read_text(), 'another step made this\n', (case, name))
+
+    # r5: a hub launch without a runtime writes its launcher through the guarded writer, never through a link or outside
+
+    def test_hub_only_launcher_never_writes_outside(self):
+        def hub_only(config=None):
+            L = {k: v for k, v in self.L().items() if k != 'runtime'}
+            if config:
+                L['config'] = {**L['config'], 'at': config}
+            return L
+        cases = {  # name: (launch for an outside dir, what to plant in the work dir)
+            'launcher dir is a link out': (lambda o: hub_only(), lambda w, o: (w / 'launcher').symlink_to(o)),
+            'launcher file is a link out': (lambda o: hub_only(), lambda w, o: ((w / 'launcher').mkdir(), (w / 'launcher/serve.py').symlink_to(o / 'victim'))),
+            'launcher path is absolute, outside': (lambda o: hub_only(str(o / 'abs' / 'serve.py')), None),
+        }
+        for case, (make, plant) in cases.items():
+            for name in ('python', 'js') if NODE else ('python',):
+                with self.subTest(case=case, sdk=name):
+                    o = self.d / f'outside-{self.n}'; self.n += 1  # a scratch dir of its own
+                    o.mkdir(); (o / 'victim').write_text('untouched\n')
+                    st = self.rendered_or_none(make(o), name)
+                    if st is None:
+                        self.assertIn('absolute', case)  # refused before anything runs
+                        continue
+                    w = self.work()
+                    if plant:
+                        plant(w, o)
+                    code = next(s['code'] for s in st if s['title'] == 'Write the launcher')
+                    r = self.sh(code, w)
+                    self.assertEqual(tree(o), {'victim': hashlib.sha256(b'untouched\n').hexdigest()},
+                                     f'{case} ({name}): the launcher was written outside the task')
+                    self.assertNotEqual(r.returncode, 0, (case, name))
 
     def test_archive_links_and_members_are_checked(self):
         base = self.work(); self.install(base)

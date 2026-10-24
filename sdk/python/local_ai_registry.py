@@ -118,6 +118,8 @@ def _check_host(l):
             _ok(_is(_RT_REPO, w.get("repo")) and _is(r"[0-9a-f]{40}", w.get("revision")) and _is(_RT_REL, w.get("at")), "hub weights repo, revision or cache dir")
             fs = w.get("files") or []
             _ok(all(_is(_RT_REL, f) for f in (fs if isinstance(fs, list) else [fs])), "hub weights files")
+    if l.get("config") and _confined(l):  # a launcher the setup steps write: a plain relative path
+        _ok(_is(_RT_REL, l["config"].get("at")), "launcher path")
     rt = l.get("runtime")
     if rt is None:
         return _check_paths(l)
@@ -148,9 +150,12 @@ def _check_host(l):
     if ws:
         _ok("packages" in rt and "huggingface-hub" in {_canon(w["name"]) for w in rt["packages"]["wheels"]} and ws[0].get("layout") == "hub",
             "weights with a runtime need hub layout and a pinned huggingface_hub wheel")
-    if l.get("config"):
-        _ok(_is(_RT_REL, l["config"].get("at")), "launcher path")
     _check_paths(l)
+
+
+def _confined(l):
+    """A host launch whose setup steps are confined (strict, staged, no links): one with a runtime or hub weights."""
+    return l.get("runtime") is not None or any(w.get("layout") == "hub" for w in _weights(l))
 
 
 def _owned(l):
@@ -230,7 +235,7 @@ def _runtime_steps(l):
     if "archive" in rt:
         a, into = rt["archive"], rt["archive"]["into"]
         f, d = _url_file(a["url"]), _q(into)
-        keep = [x for _, x in _owned(l) if x.startswith(into + "/")]
+        keep = [x for _, x in _owned(l) if x.lower().startswith(into.lower() + "/")]  # ignoring case, as macOS does
         out.append({"title": "Install the runtime", "code": _strict([
             _NOLINK,
             f"nolink {_prefixes(into)}",
@@ -246,7 +251,8 @@ def _runtime_steps(l):
             'for n in $(ls -A "$s/x"); do',
             '  case $n in .local-ai-*|*[!A-Za-z0-9._+-]*) echo "local-ai: unexpected archive entry $n" >&2; exit 1;; esac',
             f'  nolink {d}/"$n"',
-            *[f'  case {_q(x + "/")} in {d}/"$n"/*) echo "local-ai: archive entry $n would replace {x}" >&2; exit 1;; esac' for x in keep],
+            '  ln=$(printf \'%s\' "$n" | tr \'[:upper:]\' \'[:lower:]\')',
+            *[f'  case "$ln" in {_q(x[len(into) + 1:].split("/")[0].lower())}) echo "local-ai: archive entry $n would replace {x}" >&2; exit 1;; esac' for x in keep],
             "done",
             _CONFINE,
             'confine "$s/x"',
@@ -358,7 +364,7 @@ def _host_steps(l):
             out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
     if l.get("config"):
         at = l["config"]["at"]
-        if rt:
+        if _confined(l):
             out.append({"title": "Write the launcher", "code": _strict([_NOLINK, _CLEAN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
                                                                          *_write(_q(_parent(at)), _q(at), at, lambda t: [f"cat > {t} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])])})
         else:

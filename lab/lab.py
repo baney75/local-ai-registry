@@ -679,6 +679,9 @@ def check_host_runtime(launch):
     hubs = [(w["at"].lower(), w["repo"].lower()) for w in weights if kind == "host" and w.get("layout") == "hub"]
     assert len(hubs) == len(set(hubs)), "a repo is listed twice in one hub cache (a second entry would replace the first)"
     rt = launch.get("runtime")
+    hub = any(w.get("layout") == "hub" for w in weights if w)
+    if kind == "host" and launch.get("config") and (rt is not None or hub):  # a launcher the setup steps write
+        assert isinstance(launch["config"].get("at"), str) and re.fullmatch(RT_REL, launch["config"]["at"]), "launcher path"
     if rt is None:
         if kind == "host":
             check_host_paths(launch)
@@ -722,8 +725,6 @@ def check_host_runtime(launch):
         assert all(w.get("layout") == "hub" for w in weights), "weights with a runtime need layout hub"
         assert "packages" in rt and "huggingface-hub" in {_canon(w["name"]) for w in rt["packages"]["wheels"]}, \
             "weights with a runtime need a pinned huggingface_hub wheel in runtime.packages"
-    if launch.get("config"):
-        assert isinstance(launch["config"].get("at"), str) and re.fullmatch(RT_REL, launch["config"]["at"]), "launcher path"
     check_host_paths(launch)
 
 

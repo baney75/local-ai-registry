@@ -79,6 +79,7 @@ function checkHost(l) {
       ok((Array.isArray(w.files) ? w.files : w.files ? [w.files] : []).every((f) => is(RT.rel, f)), "hub weights files");
     }
   }
+  if (l.config && confined(l)) ok(is(RT.rel, l.config.at), "launcher path");  // a launcher the setup steps write: a plain relative path
   const rt = l.runtime;
   if (rt === undefined || rt === null) return checkPaths(l);
   ok(keys(rt) && Object.keys(rt).length && Object.keys(rt).every((k) => ["archive", "python", "packages"].includes(k)) && !l.pip?.length, "runtime keys");
@@ -107,10 +108,11 @@ function checkHost(l) {
   }
   if (ws.length) ok("packages" in rt && rt.packages.wheels.some((w) => canon(w.name) === "huggingface-hub") && ws[0].layout === "hub",
     "weights with a runtime need hub layout and a pinned huggingface_hub wheel");
-  if (l.config) ok(is(RT.rel, l.config.at), "launcher path");
   checkPaths(l);
 }
 
+/** A host launch whose setup steps are confined (strict, staged, no links): one with a runtime or hub weights. */
+const confined = (l) => (l.runtime !== undefined && l.runtime !== null) || weights(l).some((w) => w.layout === "hub");
 /** What the setup steps publish besides the archive's entries: packages target and dir, host hub caches, launcher. */
 function owned(l) {
   const pk = l.runtime?.packages, hub = weights(l).filter((w) => w.layout === "hub");
@@ -160,7 +162,7 @@ function runtimeSteps(l) {
   const rt = l.runtime, out = [];
   if (rt.archive) {
     const a = rt.archive, into = a.into, f = urlFile(a.url), d = q(into);
-    const keep = owned(l).map(([, x]) => x).filter((x) => x.startsWith(`${into}/`));
+    const keep = owned(l).map(([, x]) => x).filter((x) => x.toLowerCase().startsWith(`${into.toLowerCase()}/`));  // ignoring case, as macOS does
     out.push({ title: "Install the runtime", code: strict([
       NOLINK,
       `nolink ${prefixes(into)}`,
@@ -176,7 +178,8 @@ function runtimeSteps(l) {
       'for n in $(ls -A "$s/x"); do',
       '  case $n in .local-ai-*|*[!A-Za-z0-9._+-]*) echo "local-ai: unexpected archive entry $n" >&2; exit 1;; esac',
       `  nolink ${d}/"$n"`,
-      ...keep.map((x) => `  case ${q(`${x}/`)} in ${d}/"$n"/*) echo "local-ai: archive entry $n would replace ${x}" >&2; exit 1;; esac`),
+      "  ln=$(printf '%s' \"$n\" | tr '[:upper:]' '[:lower:]')",
+      ...keep.map((x) => `  case "$ln" in ${q(x.slice(into.length + 1).split("/")[0].toLowerCase())}) echo "local-ai: archive entry $n would replace ${x}" >&2; exit 1;; esac`),
       "done",
       CONFINE,
       'confine "$s/x"',
@@ -269,7 +272,7 @@ function hostSteps(l) {
   }
   if (l.config) {
     const at = l.config.at;
-    if (rt) out.push({ title: "Write the launcher", code: strict([NOLINK, CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
+    if (confined(l)) out.push({ title: "Write the launcher", code: strict([NOLINK, CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
       ...write(q(parent(at)), q(at), at, (t) => [`cat > ${t} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`])]) });
     else out.push({ title: "Write the launcher", code: `${at.includes("/") ? `mkdir -p ${at.replace(/\/[^/]*$/, "")}\n` : ""}cat > ${at} <<'EOF'\n${l.config.text.trimEnd()}\nEOF` });
   }
