@@ -125,6 +125,11 @@ case "$1" in
     esac ;;
   logs)
     cid=${!#}; [ -d "$S/$cid" ] || exit 125
+    if [ -n "${FAKE_LOGS_UNTIL:-}" ]; then  # a slow log save that the deadline lands in; it ignores TERM
+      trap '' TERM; date +%s.%N >> "$FAKE_STATE/logs-start"
+      while [ "$(date +%s)" -lt "$FAKE_LOGS_UNTIL" ]; do sleep 0.2; done
+      date +%s.%N >> "$FAKE_STATE/logs-end"
+    fi
     case "${FAKE_LOGS:-ok}" in fail) exit 1 ;; empty) exit 0 ;; *) cat "$S/$cid/out.log"; echo "fake log end" ;; esac ;;
   kill) cid=${!#}; [ -d "$S/$cid" ] || exit 125; stop "$cid" ;;
   rm)
@@ -214,8 +219,11 @@ class Repro(unittest.TestCase):
 
     def run_repro(self, timeout=900, **env):
         t0 = time.monotonic()
-        r = subprocess.run(["bash", os.path.join(self.repo, REL, "repro.sh")], env={**self.env, **env}, capture_output=True, text=True, timeout=timeout)
-        self.out = r.stdout + r.stderr
+        out = os.path.join(self.t, f"repro-out-{time.monotonic_ns()}.txt")
+        with open(out, "w") as f:  # a file, not a pipe: a leaked descriptor cannot hang the harness (assertClean finds the leak)
+            r = subprocess.run(["bash", os.path.join(self.repo, REL, "repro.sh")], env={**self.env, **env}, stdin=subprocess.DEVNULL,
+                               stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+        self.out = open(out).read()
         self.elapsed = time.monotonic() - t0
         return r.returncode
 
@@ -403,6 +411,40 @@ class Repro(unittest.TestCase):
         self.assertLess(used, reserve)
         self.assertIn("NOT removed", self.out)
         self.assertLess(self.elapsed, 20 + reserve)
+
+    # ---- Sol r3: the overall deadline lands inside an already running cleanup (in save_logs)
+    def deadline_in_cleanup(self, **env):
+        import re
+        bound = 20  # cleanup starts about 10 s in; the slow log save runs until start + 25 s, inside its own 30 s bound
+        t0 = time.time()
+        until = int(t0) + bound + 5
+        rc = self.run_repro(REPRO_TIMEOUT=str(bound), FAKE_LOGS_UNTIL=str(until), **env)
+        self.assertEqual(rc, 124, self.out[-3000:])  # the bound fired; the run never reached KILL (137)
+        start = float(open(os.path.join(self.state, "logs-start")).read().split()[0])
+        end = float(open(os.path.join(self.state, "logs-end")).read().split()[0])
+        self.assertLess(start, t0 + bound - 1); self.assertLess(t0 + bound + 1, end)  # the deadline landed inside save_logs
+        R = self.run_dir()
+        log = open(os.path.join(R, "repro.log")).read()
+        m = re.search(r"signal 15 during cleanup at ([0-9.]+): deferred", log)
+        self.assertTrue(m, log[-3000:])
+        self.assertGreaterEqual(float(m.group(1)), start)  # bash runs the handler once the interrupted step returns
+        self.assertNotIn("during cleanup", open(os.path.join(R, "server.log")).read())  # the raw server log stays raw
+        after = self.out[self.out.index("cleanup (reserve"):]
+        self.assertIn("server log saved", after)
+        self.assertIn("removed (positively gone)", after)  # removal was attempted and confirmed after the signal
+        v = re.search(r"cleanup verdict: ok=(\d) after (\d+)s of (\d+)s; exit (\d+)", after)
+        self.assertTrue(v, after[-2000:])
+        self.assertEqual(v.group(1), "1"); self.assertLess(int(v.group(2)), int(v.group(3)))
+        self.assertNotEqual(v.group(4), "0")  # a run that hit its deadline never reports success
+        self.assertIn(f"rm -f -t 10 ", self.calls()[self.calls().index("logs --timestamps"):])
+        self.assertClean()  # container positively gone, recorder and fake server gone, foreign container untouched
+        return v.group(4)
+
+    def test_deadline_during_cleanup_after_success(self):
+        self.assertEqual(self.deadline_in_cleanup(), "143")
+
+    def test_deadline_during_cleanup_after_failure(self):
+        self.assertEqual(self.deadline_in_cleanup(FAKE_FAULTS="reasoning_length"), "8")
 
     def test_container_start_failure(self):
         self.assertEqual(self.run_repro(FAKE_RUN_FAIL="1"), 5); self.assertClean()

@@ -77,7 +77,7 @@ stamp() { echo "[$(date -u +%FT%TZ)] $*"; }
 stamp "run $RUNID in $RUN"
 
 CLEANUP_RESERVE=540
-RC=0; CREATED=0; CLEANED=0; REC=; REC_T=
+RC=0; CREATED=0; CLEANED=0; IN_CLEANUP=0; SIGNALLED=; REC=; REC_T=
 t() { local b=$1; shift; timeout -k 5 "$b" "$@"; }  # every bounded call: worst case b + 5 s
 
 # Start time of a process (field 22 of /proc/<pid>/stat, read after the command name); fails if it is
@@ -218,11 +218,24 @@ cleanup() {
   echo "$ok" > "$RUN/cleanup.ok"
   if [ "$RC" -eq 0 ] && [ "$ok" != 1 ]; then RC=9; fi
   if [ "$RC" -eq 0 ] && [ -n "${SYBIL_TEST_POWER_DIR:-}" ]; then RC=10; fi
+  if [ -n "$SIGNALLED" ] && [ "$RC" -eq 0 ]; then RC=$SIGNALLED; fi  # a deadline during cleanup still fails the run
   stamp "cleanup verdict: ok=$ok after $((SECONDS - t0))s of ${CLEANUP_RESERVE}s; exit $RC"
 }
-trap 'S=$?; [ "$RC" -eq 0 ] && RC=$S; cleanup; exit $RC' EXIT  # an unexpected exit keeps its status
-trap 'RC=130; exit 130' INT
-trap 'RC=143; exit 143' TERM
+# A signal outside cleanup ends the run, and the EXIT trap then cleans up. A signal while cleanup is running
+# (the overall deadline can land in it) is recorded and cleanup carries on to its verdict: the outer
+# timeout's 540 s KILL reserve is what bounds it.
+on_signal() {
+  if [ "$IN_CLEANUP" = 1 ]; then
+    SIGNALLED=${SIGNALLED:-$1}
+    # straight to the run log: bash can run this inside the interrupted command's redirections (server.log)
+    stamp "signal $(( $1 - 128 )) during cleanup at $(date +%s.%N): deferred; cleanup continues" >> "$RUN/repro.log" 2>&1
+    return 0
+  fi
+  RC=$1; exit "$1"
+}
+trap 'S=$?; IN_CLEANUP=1; [ "$RC" -eq 0 ] && RC=$S; cleanup; exit $RC' EXIT  # an unexpected exit keeps its status
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 fail() { RC=$1; shift; stamp "$*"; exit "$RC"; }
 
 # 0. One run per STORE (fd 9 is closed for every child so no helper or container keeps the lock)
