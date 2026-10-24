@@ -675,6 +675,9 @@ def check_host_runtime(launch):
             fs = w.get("files") or []
             fs = fs if isinstance(fs, list) else [fs]
             assert all(isinstance(f, str) and re.fullmatch(RT_REL, f) for f in fs), "hub weights files"
+    # one entry per repo per cache: each publish replaces the whole model directory, so a second entry would erase the first
+    hubs = [(w["at"].lower(), w["repo"].lower()) for w in weights if kind == "host" and w.get("layout") == "hub"]
+    assert len(hubs) == len(set(hubs)), "a repo is listed twice in one hub cache (a second entry would replace the first)"
     rt = launch.get("runtime")
     if rt is None:
         if kind == "host":
@@ -725,6 +728,7 @@ def check_host_runtime(launch):
 
 
 def _overlap(a, b):
+    a, b = a.lower(), b.lower()  # macOS file systems ignore case
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
@@ -740,12 +744,12 @@ def check_host_paths(launch):
         ([("launcher", launch["config"]["at"])] if launch.get("config") and (rt or hub) else [])
     for i, (na, a) in enumerate(owned):
         for nb, b in owned[i + 1:]:
-            assert na == nb == "weights.at" or not _overlap(a, b), f"{na} {a} and {nb} {b} overlap"
+            assert (na == nb == "weights.at" and a.lower() == b.lower()) or not _overlap(a, b), f"{na} {a} and {nb} {b} overlap"
     if rt.get("archive"):
         into, py = rt["archive"]["into"], rt.get("python")
         entry = into + "/" + py[len(into) + 1:].split("/")[0] if py else None
         for n, x in owned:
-            assert not (x == into or into.startswith(x + "/")), f"{n} {x} would replace runtime.archive.into"
+            assert not (x.lower() == into.lower() or into.lower().startswith(x.lower() + "/")), f"{n} {x} would replace runtime.archive.into"
             assert not entry or not _overlap(x, entry), f"{n} {x} overlaps the interpreter's archive entry {entry}"
 
 

@@ -64,13 +64,17 @@ const is = (re, v) => typeof v === "string" && re.test(v);
 const keys = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o).sort().join(",") : null);
 const canon = (n) => n.replace(/[-_.]+/g, "-").toLowerCase();
 const urlFile = (u) => decodeURIComponent(u.slice(u.lastIndexOf("/") + 1));
-const nested = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+/** Equal or one inside the other, ignoring case (macOS file systems do). */
+const nested = (a, b) => { a = a.toLowerCase(); b = b.toLowerCase(); return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`); };
 function checkHost(l) {
-  const ws = weights(l);
+  const ws = weights(l), hubs = new Set();
   ok(new Set(ws.map((w) => w.layout === "hub")).size <= 1, "hub and directory weights mixed in one launch");
   for (const w of ws) {
     if ("ref" in w) ok(w.layout === "hub" && is(RT.ref, w.ref), `weights.ref ${w.ref}`);
     if (w.layout === "hub") {
+      const key = JSON.stringify([String(w.at).toLowerCase(), String(w.repo).toLowerCase()]);
+      ok(!hubs.has(key), `weights ${w.repo} listed twice in the cache ${w.at}`);
+      hubs.add(key);
       ok(is(RT.repo, w.repo) && is(RT.rev, w.revision) && is(RT.rel, w.at), "hub weights repo, revision or cache dir");
       ok((Array.isArray(w.files) ? w.files : w.files ? [w.files] : []).every((f) => is(RT.rel, f)), "hub weights files");
     }
@@ -117,12 +121,12 @@ function owned(l) {
  *  holds runtime.archive.into, and none lies in the archive entry that holds the interpreter. */
 function checkPaths(l) {
   const own = owned(l);
-  own.forEach(([na, a], i) => own.slice(i + 1).forEach(([nb, b]) => ok((na === "weights.at" && nb === "weights.at") || !nested(a, b), `${na} ${a} and ${nb} ${b} overlap`)));
+  own.forEach(([na, a], i) => own.slice(i + 1).forEach(([nb, b]) => ok((na === "weights.at" && nb === "weights.at" && a.toLowerCase() === b.toLowerCase()) || !nested(a, b), `${na} ${a} and ${nb} ${b} overlap`)));
   const a = l.runtime?.archive;
   if (a) {
     const py = l.runtime.python, entry = py ? `${a.into}/${py.slice(a.into.length + 1).split("/")[0]}` : null;
     for (const [n, x] of own) {
-      ok(!(x === a.into || a.into.startsWith(`${x}/`)), `${n} ${x} would replace runtime.archive.into`);
+      ok(!(x.toLowerCase() === a.into.toLowerCase() || a.into.toLowerCase().startsWith(`${x.toLowerCase()}/`)), `${n} ${x} would replace runtime.archive.into`);
       ok(!entry || !nested(x, entry), `${n} ${x} overlaps the interpreter's archive entry ${entry}`);
     }
   }
@@ -135,7 +139,10 @@ const HUB = "import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub i
 // no device, fifo, socket or set-id file. The same text in both SDKs.
 const CONFINE = "confine() {\n  b=$(cd -P \"$1\" && pwd -P)\n  if [ -n \"$(find \"$1\" ! -type f ! -type d ! -type l)\" ]; then echo \"local-ai: $1 holds a device, fifo or socket\" >&2; exit 1; fi\n  if [ -n \"$(find \"$1\" -type f \\( -perm -4000 -o -perm -2000 \\))\" ]; then echo \"local-ai: $1 holds a setuid or setgid file\" >&2; exit 1; fi\n  find \"$1\" -type l | while IFS= read -r l; do\n    if [ ! -L \"$l\" ]; then echo \"local-ai: unexpected name under $1\" >&2; exit 1; fi\n    k=$(readlink \"$l\")\n    case $k in /*) echo \"local-ai: link $l is absolute\" >&2; exit 1;; esac\n    if [ ! -e \"$l\" ]; then echo \"local-ai: link $l is dangling\" >&2; exit 1; fi\n    if [ -d \"$l\" ]; then r=$(cd -P \"$l\" && pwd -P); else\n      case ${k##*/} in .|..) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n      r=$(cd -P \"$(dirname \"$l\")\" && cd -P \"$(dirname \"$k\")\" && pwd -P)/${k##*/}\n    fi\n    case $r/ in \"$b\"/*) ;; *) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n  done\n  find \"$1\" -type f -links +1 | while IFS= read -r f; do\n    if [ \"$(ls -ld \"$f\" | awk '{print $2}')\" != \"$(find \"$1\" -samefile \"$f\" | wc -l | tr -d ' ')\" ]; then echo \"local-ai: $f is hard-linked outside $1\" >&2; exit 1; fi\n  done\n}";
 // The download sees no ambient Hugging Face token, config, cache or .netrc: only directories inside its staging cache.
-const HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\"; }";
+const HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; TMPDIR=$h/.tmp; TMP=$h/.tmp; TEMP=$h/.tmp; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE TMPDIR TMP TEMP HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\" \"$TMPDIR\"; }";
+// pip sees no config file (PIP_CONFIG_FILE=/dev/null turns off every one, which --isolated does not), and its temp files,
+// home and cache are inside the packages staging directory.
+const PIPENV = "pipenv() { h=$(cd -P \"$1\" && pwd -P)/.pip; mkdir -p \"$h/tmp\" \"$h/home\" \"$h/cache\"; PIP_CONFIG_FILE=/dev/null; TMPDIR=$h/tmp; TMP=$h/tmp; TEMP=$h/tmp; HOME=$h/home; XDG_CACHE_HOME=$h/cache; XDG_CONFIG_HOME=$h/home/.config; export PIP_CONFIG_FILE TMPDIR TMP TEMP HOME XDG_CACHE_HOME XDG_CONFIG_HOME; }";
 const KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }';
 const CLEAN = `c= o= t=\ntrap 'for x in "$c" "$o" "$t"; do if [ -n "$x" ]; then rm -rf "$x"; fi; done' EXIT`;
 const HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; ' +
@@ -160,7 +167,7 @@ function runtimeSteps(l) {
       `mkdir -p ${d}`,
       `s=$(mktemp -d ${d}/.local-ai-runtime.XXXXXX)`,
       `trap 'rm -rf "$s"' EXIT`,
-      `curl -fL -o "$s"/${q(f)} ${q(a.url)}`,
+      `curl -q -fL -o "$s"/${q(f)} ${q(a.url)}`,
       `(cd "$s" && echo '${a.sha256}  ${f}' | shasum -a 256 -c -)`,
       'mkdir "$s/x" "$s/old"',
       `tar -tzf "$s"/${q(f)} | while IFS= read -r m; do case $m in /*|..|../*|*/..|*/../*) echo "local-ai: archive member $m leaves the archive" >&2; exit 1;; esac; done`,
@@ -194,12 +201,13 @@ function runtimeSteps(l) {
       `o=$(mktemp -d ${q(parent(pk.dir))}/.local-ai-old.XXXXXX)`,
       `s=$(mktemp -d ${q(parent(pk.target))}/.local-ai-packages.XXXXXX)`,
       `trap 'rm -rf "$w" "$o" "$s"' EXIT`,
-      ...pk.wheels.map((w, i) => `curl -fL -o "$w"/${q(fs[i])} ${q(w.url)}`),
+      ...pk.wheels.map((w, i) => `curl -q -fL -o "$w"/${q(fs[i])} ${q(w.url)}`),
       `printf '%s\\n' ${pk.wheels.map((w, i) => q(`${w.sha256}  ${fs[i]}`)).join(" ")} > "$w/SHA256SUMS"`,
       '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
       `printf '%s\\n' ${pk.wheels.map((w) => q(`${w.name}==${w.version} --hash=sha256:${w.sha256}`)).join(" ")} > "$w/requirements.lock.txt"`,
-      `${q(`./${rt.python}`)} -I -m pip --isolated install --no-index --find-links "$w" --only-binary :all: --require-hashes ` +
-      '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --disable-pip-version-check',
+      PIPENV,
+      `(pipenv "$s"; exec ${q(`./${rt.python}`)} -I -m pip --isolated install --no-index --find-links "$w" --only-binary :all: --require-hashes ` +
+      '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --no-cache-dir --disable-pip-version-check)',
       `nolink ${t} ${d}`,
       KEEP,
       'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; ' +

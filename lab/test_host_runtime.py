@@ -222,6 +222,35 @@ COLLIDE = {
 }
 BAD.update({f'collision: {k}': v for k, v in COLLIDE.items()})
 
+
+def two_hub(first, second, runtime=True):
+    """The fixture with two hub weights entries: the first is the fixture's own with `first` applied, then `second`."""
+    def make():
+        L = launch()
+        if not runtime:
+            del L['runtime']
+        w = L['weights'][0]
+        L['weights'] = [{**w, **first}, {**w, 'ref': 'main', **second}]
+        return L
+    return make
+
+
+DRAFT = {'repo': 'org/draft', 'revision': 'c' * 40}
+# r4: hub caches may be shared only when identical, and a repo may appear once per cache (each publish replaces its
+# whole model directory, so a nested cache or a second entry would erase the other)
+CACHES = {
+    'second hub cache inside the first (in its model dir)': two_hub({}, {**DRAFT, 'at': 'rt/hf-cache/models--org--model/blobs'}),
+    'first hub cache inside the second': two_hub({'at': 'rt/hf-cache/inner'}, {**DRAFT, 'at': 'rt/hf-cache'}),
+    'hub caches nested, differing in case': two_hub({'at': 'rt/HF-cache'}, {**DRAFT, 'at': 'rt/hf-cache/inner'}),
+    'hub caches nested, no runtime': two_hub({}, {**DRAFT, 'at': 'rt/hf-cache/models--org--model/blobs'}, runtime=False),
+    'same repo twice in one cache, two revisions': two_hub({'ref': 'v1'}, {'revision': 'd' * 40, 'ref': 'v2'}),
+    'same repo twice in one cache, file subsets': two_hub({'files': ['config.json']}, {'files': ['model.safetensors']}),
+    'same repo twice in one cache, repo case differs': two_hub({}, {'repo': 'Org/Model', 'revision': 'd' * 40}),
+    'same repo twice, the cache path differs in case': two_hub({}, {'at': 'rt/HF-cache', 'revision': 'd' * 40}),
+    'same repo twice in one cache, no runtime': two_hub({}, {'revision': 'd' * 40}, runtime=False),
+}
+BAD.update({f'cache: {k}': v for k, v in CACHES.items()})
+
 # Rejected by lab.py check; the SDKs never render these fields for a container, so there is nothing to refuse there.
 BAD_LAB = {
     'runtime on a container': lambda: {**launch(), 'kind': None},
@@ -342,7 +371,7 @@ class StepsTest(unittest.TestCase):
 
     def test_archive_is_checked_before_extracting(self):
         code = self.by['Install the runtime']
-        self.assertIn(f'curl -fL -o "$s"/{ARCHIVE} {ARCHIVE_URL}', code)
+        self.assertIn(f'curl -q -fL -o "$s"/{ARCHIVE} {ARCHIVE_URL}', code)
         self.assertLess(code.index('shasum -a 256 -c'), code.index('tar -xzf'))
 
     def test_packages_are_hash_locked_offline_and_staged(self):
@@ -383,11 +412,11 @@ def make_wheel(d, name, version, requires=(), module='VERSION = 1\n'):
 
 # The pinned huggingface_hub stand-in: makes the snapshot (unless FAKE_HF_MISS) and records which copy ran.
 HUB = '''import json, os
-ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HOME", "HF_XET_CACHE", "HF_ENDPOINT", "HF_TOKEN_PATH", "HOME", "NETRC")
+ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HOME", "HF_XET_CACHE", "HF_ENDPOINT", "HF_TOKEN_PATH", "HOME", "NETRC", "TMPDIR")
 def snapshot_download(repo_id, revision=None, cache_dir=None, allow_patterns=None, token=None):
     open("HUB_USED", "w").write(os.path.abspath(__file__))
     json.dump({"token": token, "cache_dir": os.path.abspath(cache_dir), **{k: os.environ.get(k) for k in ENV}}, open("HUB_ENV", "w"))
-    if os.environ.get("FAKE_HF_MISS"):
+    if os.environ.get("FAKE_HF_MISS") or os.environ.get("FAKE_HF_MISS_REPO") == repo_id:
         return cache_dir
     # the real layout: a blob, a snapshot file linking to it, and a lock under the cache root
     m = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"))
@@ -424,7 +453,13 @@ m="$dir/models--$(printf '%s' "$repo" | sed 's#/#--#')"
 mkdir -p "$m/blobs" "$m/snapshots/$rev" && echo '{}' > "$m/blobs/0f1e2d" && ln -s ../../blobs/0f1e2d "$m/snapshots/$rev/config.json"
 '''
 FAKE_CURL = '''#!/bin/sh
-# curl -fL -o FILE URL: copy the URL's file from $FAKE_SERVER, or fail like curl -f on a 404
+# curl -fL -o FILE URL: copy the URL's file from $FAKE_SERVER, or fail like curl -f on a 404. Like real curl, it reads
+# $CURL_HOME/.curlrc or $HOME/.curlrc (here only a `trace = FILE` line) unless -q is its first argument.
+if [ "$1" != "-q" ]; then
+  for rc in "${CURL_HOME:-$HOME}/.curlrc" "$HOME/.curlrc"; do
+    if [ -f "$rc" ]; then t=$(sed -n 's/^trace *= *//p' "$rc"); if [ -n "$t" ]; then echo "curl read $rc" >> "$t"; fi; fi
+  done
+fi
 out=; url=
 while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done
 name=$(printf '%s' "${url##*/}" | sed 's/%2B/+/g')
@@ -481,7 +516,11 @@ class SandboxTest(unittest.TestCase):
             f.chmod(0o755)
         # the "interpreter archive": python/bin/python3 hands off to this test's own interpreter by absolute path
         src = d / 'src' / 'python' / 'bin'; src.mkdir(parents=True)
-        (src / 'python3').write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'); (src / 'python3').chmod(0o755)
+        # (and records, for a pip run, the environment and arguments pip is started with)
+        (src / 'python3').write_text('#!/bin/sh\ncase " $* " in *" -m pip "*) printf \'TMPDIR=%s\\nTMP=%s\\nTEMP=%s\\nHOME=%s\\nXDG_CACHE_HOME=%s\\n'
+                                     'XDG_CONFIG_HOME=%s\\nPIP_CONFIG_FILE=%s\\nARGS=%s\\n\' "$TMPDIR" "$TMP" "$TEMP" "$HOME" "$XDG_CACHE_HOME" '
+                                     '"$XDG_CONFIG_HOME" "$PIP_CONFIG_FILE" "$*" > PIP_ENV;; esac\n'
+                                     f'exec "{sys.executable}" "$@"\n'); (src / 'python3').chmod(0o755)
         subprocess.run(['tar', '-czf', str(self.server / ARCHIVE), '-C', str(d / 'src'), 'python'], check=True)
         a = make_wheel(self.server, 'fixture-a', '1.0', requires=['fixture-b'])
         b = make_wheel(self.server, 'fixture-b', '2.0')
@@ -715,8 +754,92 @@ class SandboxTest(unittest.TestCase):
         for k in ('HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'HF_ENDPOINT', 'HF_TOKEN_PATH', 'NETRC'):
             self.assertIsNone(seen.get(k), k)
         hub = Path(w).resolve() / 'rt/hf-cache'
-        for k in ('HF_HOME', 'HF_XET_CACHE', 'HOME'):
+        for k in ('HF_HOME', 'HF_XET_CACHE', 'HOME', 'TMPDIR'):
+            self.assertIsNotNone(seen.get(k), f'{k} is not set inside the staging cache')
             self.assertTrue(Path(seen[k]).resolve().is_relative_to(hub) and '.local-ai-hub.' in seen[k], (k, seen[k]))
+
+    # r4: nested or duplicate hub caches would erase a model on a rerun; both SDKs refuse to render them. This also runs the
+    # reviewer's reproductions on any rendering that does not refuse (an older SDK), so it fails there on the lost data.
+
+    def rendered_or_none(self, L, name):
+        try:
+            return renderings(L)[name]
+        except (ValueError, subprocess.CalledProcessError):
+            return None
+
+    def test_nested_or_duplicate_caches_never_lose_a_model(self):
+        cases = {'nested': (CACHES['second hub cache inside the first (in its model dir)'](),
+                            'rt/hf-cache/models--org--model/blobs/models--org--draft/snapshots/' + 'c' * 40),
+                 'two revisions': (CACHES['same repo twice in one cache, two revisions'](), None)}
+        for case, (L, second) in cases.items():
+            for name in ('python', 'js') if NODE else ('python',):
+                with self.subTest(case=case, sdk=name):
+                    st = self.rendered_or_none(L, name)
+                    if st is None:
+                        continue  # refused: nothing can be lost
+                    code = next(s['code'] for s in st if s['title'] == 'Download the weights')
+                    w = self.work(); self.install(w)
+                    r = self.sh(code, w)
+                    self.assertEqual(r.returncode, 0, (case, name, r.stderr))
+                    m = w / 'rt/hf-cache/models--org--model'
+                    if second:  # rerun: the first publish succeeds, the second download fails; the old second must survive
+                        self.assertTrue((w / second).exists(), (case, name))
+                        self.sh(code, w, FAKE_HF_MISS_REPO='org/draft')
+                        self.assertTrue((w / second).exists(), f'{case} ({name}): the previous org/draft model was deleted')
+                    else:  # both requested revisions and both refs must be there
+                        self.assertTrue((m / 'snapshots' / REV).exists() and (m / 'refs/v1').exists(), f'{case} ({name}): revision v1 was overwritten')
+
+    def test_refused_by_both_sdks_and_lab(self):
+        for case, make in CACHES.items():
+            L = make()
+            self.assertTrue(lab_rejects(L), case)
+            for name in ('python', 'js') if NODE else ('python',):
+                self.assertIsNone(self.rendered_or_none(L, name), (case, name))
+
+    # r4: curl reads no ambient config (-q first), and pip reads no config file and keeps its temp, home and cache inside
+    # the staging directory (synthetic files in the scratch directory only)
+
+    def test_every_curl_starts_with_q(self):
+        for name, st in renderings(self.L()).items():
+            lines = [x.strip() for s in st for x in s['code'].splitlines() if 'curl ' in x]
+            self.assertTrue(lines, name)
+            self.assertTrue(all(x.startswith('curl -q ') for x in lines), (name, [x for x in lines if not x.startswith('curl -q ')]))
+
+    def test_curl_reads_no_ambient_config(self):
+        for name in renderings(self.L()):
+            w = self.work()
+            for d in ('curl-home', 'home'):
+                (self.outside / d).mkdir(exist_ok=True)
+                (self.outside / d / '.curlrc').write_text(f'trace = {self.outside}/curl.trace\n')
+            env = {'CURL_HOME': str(self.outside / 'curl-home'), 'HOME': str(self.outside / 'home')}
+            for title in ('Install the runtime', 'Install the packages'):
+                r = self.step(self.L(), title, w, name, **env)
+                self.assertEqual(r.returncode, 0, (name, title, r.stderr))
+            self.assertFalse((self.outside / 'curl.trace').exists(), (name, (self.outside / 'curl.trace').read_text() if (self.outside / 'curl.trace').exists() else ''))
+
+    def test_pip_reads_no_config_and_writes_nothing_outside(self):
+        for name in renderings(self.L()):
+            w = self.work()
+            self.assertEqual(self.step(self.L(), 'Install the runtime', w, name).returncode, 0, name)
+            o = self.outside / name; o.mkdir()
+            for d in ('tmp', 'home', 'xdg-cache', 'xdg-config'):
+                (o / d).mkdir()
+            (o / 'pip.conf').write_text(f'[global]\nlog = {o}/pip.log\n')
+            env = {'PIP_CONFIG_FILE': str(o / 'pip.conf'), 'PIP_LOG': str(o / 'pip-env.log'), 'TMPDIR': str(o / 'tmp'),
+                   'TMP': str(o / 'tmp'), 'TEMP': str(o / 'tmp'), 'HOME': str(o / 'home'), 'XDG_CACHE_HOME': str(o / 'xdg-cache'),
+                   'XDG_CONFIG_HOME': str(o / 'xdg-config')}
+            r = self.step(self.L(), 'Install the packages', w, name, **env)
+            self.assertEqual(r.returncode, 0, (name, r.stderr[-2000:]))
+            self.assertTrue((w / 'rt/site/fixture_a/__init__.py').exists(), name)
+            # pip deletes its temp trees after it runs, so check where it was told to put them
+            seen = dict(line.split('=', 1) for line in (w / 'PIP_ENV').read_text().splitlines())
+            self.assertEqual(seen['PIP_CONFIG_FILE'], '/dev/null', name)
+            self.assertIn('--no-cache-dir', seen['ARGS'].split(), name)
+            stage = Path(w).resolve() / 'rt'
+            for k in ('TMPDIR', 'TMP', 'TEMP', 'HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME'):
+                self.assertTrue(seen[k] and Path(seen[k]).resolve().is_relative_to(stage) and '.local-ai-packages.' in seen[k], (name, k, seen[k]))
+            self.assertEqual(sorted(str(p.relative_to(o)) for p in o.rglob('*')), ['home', 'pip.conf', 'tmp', 'xdg-cache', 'xdg-config'], name)
+            self.assertEqual(staging_left(w), [], name)
 
     def test_pinned_download_uses_no_ambient_credentials(self):
         for name in renderings(self.L()):

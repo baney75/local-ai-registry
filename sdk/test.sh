@@ -165,6 +165,7 @@ shapes = {"full": full,
     "hub with files": {**full, "weights": [{**full["weights"][0], "files": ["config.json", "model.safetensors"]}]},
     "two hub weights in one cache": {**full, "weights": [full["weights"][0], {**full["weights"][0], "repo": "org/draft", "revision": "c" * 40}]},
     "nested under one directory": T.launch(root="opt/rt"),
+    "same repo in two separate caches": {**full, "weights": [full["weights"][0], {**full["weights"][0], "at": "rt/hf-other", "revision": "d" * 40}]},
     "hub weights without a runtime": {k: v for k, v in full.items() if k != "runtime"}}
 cases = {**{f"ok: {k}": {"model": "rt", "launch": v} for k, v in shapes.items()},
          **{f"bad: {k}": {"model": "rt", "launch": make()} for k, make in T.BAD.items()}}

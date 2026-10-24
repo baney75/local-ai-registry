@@ -106,12 +106,15 @@ def _url_file(url):
 
 def _check_host(l):
     """Refuse to render a host runtime or hub weights that lab.py check would reject."""
-    ws = _weights(l)
+    ws, hubs = _weights(l), set()
     _ok(len({w.get("layout") == "hub" for w in ws}) <= 1, "hub and directory weights mixed in one launch")
     for w in ws:
         if "ref" in w:
             _ok(w.get("layout") == "hub" and _is(_RT_REF, w["ref"]), f"weights.ref {w.get('ref')!r}")
         if w.get("layout") == "hub":
+            key = (str(w.get("at")).lower(), str(w.get("repo")).lower())
+            _ok(key not in hubs, f"weights {w.get('repo')} listed twice in the cache {w.get('at')}")
+            hubs.add(key)
             _ok(_is(_RT_REPO, w.get("repo")) and _is(r"[0-9a-f]{40}", w.get("revision")) and _is(_RT_REL, w.get("at")), "hub weights repo, revision or cache dir")
             fs = w.get("files") or []
             _ok(all(_is(_RT_REL, f) for f in (fs if isinstance(fs, list) else [fs])), "hub weights files")
@@ -164,17 +167,19 @@ def _check_paths(l):
     owned = _owned(l)
     for i, (na, a) in enumerate(owned):
         for nb, b in owned[i + 1:]:
-            _ok(na == nb == "weights.at" or not _nested(a, b), f"{na} {a} and {nb} {b} overlap")
+            _ok((na == nb == "weights.at" and a.lower() == b.lower()) or not _nested(a, b), f"{na} {a} and {nb} {b} overlap")
     a = (l.get("runtime") or {}).get("archive")
     if a:
         py = l["runtime"].get("python")
         entry = a["into"] + "/" + py[len(a["into"]) + 1:].split("/")[0] if py else None
         for n, x in owned:
-            _ok(not (x == a["into"] or a["into"].startswith(x + "/")), f"{n} {x} would replace runtime.archive.into")
+            _ok(not (x.lower() == a["into"].lower() or a["into"].lower().startswith(x.lower() + "/")), f"{n} {x} would replace runtime.archive.into")
             _ok(not entry or not _nested(x, entry), f"{n} {x} overlaps the interpreter's archive entry {entry}")
 
 
 def _nested(a, b):
+    """Equal or one inside the other, ignoring case (macOS file systems do)."""
+    a, b = a.lower(), b.lower()
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
@@ -190,7 +195,10 @@ _HUB = ("import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub impor
 # no device, fifo, socket or set-id file. The same text in both SDKs.
 _CONFINE = "confine() {\n  b=$(cd -P \"$1\" && pwd -P)\n  if [ -n \"$(find \"$1\" ! -type f ! -type d ! -type l)\" ]; then echo \"local-ai: $1 holds a device, fifo or socket\" >&2; exit 1; fi\n  if [ -n \"$(find \"$1\" -type f \\( -perm -4000 -o -perm -2000 \\))\" ]; then echo \"local-ai: $1 holds a setuid or setgid file\" >&2; exit 1; fi\n  find \"$1\" -type l | while IFS= read -r l; do\n    if [ ! -L \"$l\" ]; then echo \"local-ai: unexpected name under $1\" >&2; exit 1; fi\n    k=$(readlink \"$l\")\n    case $k in /*) echo \"local-ai: link $l is absolute\" >&2; exit 1;; esac\n    if [ ! -e \"$l\" ]; then echo \"local-ai: link $l is dangling\" >&2; exit 1; fi\n    if [ -d \"$l\" ]; then r=$(cd -P \"$l\" && pwd -P); else\n      case ${k##*/} in .|..) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n      r=$(cd -P \"$(dirname \"$l\")\" && cd -P \"$(dirname \"$k\")\" && pwd -P)/${k##*/}\n    fi\n    case $r/ in \"$b\"/*) ;; *) echo \"local-ai: link $l leaves $1\" >&2; exit 1;; esac\n  done\n  find \"$1\" -type f -links +1 | while IFS= read -r f; do\n    if [ \"$(ls -ld \"$f\" | awk '{print $2}')\" != \"$(find \"$1\" -samefile \"$f\" | wc -l | tr -d ' ')\" ]; then echo \"local-ai: $f is hard-linked outside $1\" >&2; exit 1; fi\n  done\n}"
 # The download sees no ambient Hugging Face token, config, cache or .netrc: only directories inside its staging cache.
-_HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\"; }"
+_HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/p; s/^\\(HUGGING_FACE_[A-Za-z0-9_]*\\)=.*/\\1/p'); do unset \"$v\"; done; unset NETRC; h=$(cd -P \"$1\" && pwd -P); HOME=$h/.home; HF_HOME=$h/.hf-home; HF_XET_CACHE=$h/.xet; TMPDIR=$h/.tmp; TMP=$h/.tmp; TEMP=$h/.tmp; HF_HUB_DISABLE_TELEMETRY=1; export HOME HF_HOME HF_XET_CACHE TMPDIR TMP TEMP HF_HUB_DISABLE_TELEMETRY; mkdir -p \"$HOME\" \"$TMPDIR\"; }"
+# pip sees no config file (PIP_CONFIG_FILE=/dev/null turns off every one, which --isolated does not), and its temp files,
+# home and cache are inside the packages staging directory.
+_PIPENV = "pipenv() { h=$(cd -P \"$1\" && pwd -P)/.pip; mkdir -p \"$h/tmp\" \"$h/home\" \"$h/cache\"; PIP_CONFIG_FILE=/dev/null; TMPDIR=$h/tmp; TMP=$h/tmp; TEMP=$h/tmp; HOME=$h/home; XDG_CACHE_HOME=$h/cache; XDG_CONFIG_HOME=$h/home/.config; export PIP_CONFIG_FILE TMPDIR TMP TEMP HOME XDG_CACHE_HOME XDG_CONFIG_HOME; }"
 
 
 _HUBUNDO = ('hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; '
@@ -229,7 +237,7 @@ def _runtime_steps(l):
             f"mkdir -p {d}",
             f"s=$(mktemp -d {d}/.local-ai-runtime.XXXXXX)",
             "trap 'rm -rf \"$s\"' EXIT",
-            f'curl -fL -o "$s"/{_q(f)} {_q(a["url"])}',
+            f'curl -q -fL -o "$s"/{_q(f)} {_q(a["url"])}',
             f"(cd \"$s\" && echo '{a['sha256']}  {f}' | shasum -a 256 -c -)",
             'mkdir "$s/x" "$s/old"',
             f'tar -tzf "$s"/{_q(f)} | while IFS= read -r m; do case $m in /*|..|../*|*/..|*/../*) echo "local-ai: archive member $m leaves the archive" >&2; exit 1;; esac; done',
@@ -264,12 +272,13 @@ def _runtime_steps(l):
             f"o=$(mktemp -d {_q(_parent(pk['dir']))}/.local-ai-old.XXXXXX)",
             f"s=$(mktemp -d {_q(_parent(pk['target']))}/.local-ai-packages.XXXXXX)",
             "trap 'rm -rf \"$w\" \"$o\" \"$s\"' EXIT",
-            *[f'curl -fL -o "$w"/{_q(f)} {_q(w["url"])}' for w, f in zip(pk["wheels"], files)],
+            *[f'curl -q -fL -o "$w"/{_q(f)} {_q(w["url"])}' for w, f in zip(pk["wheels"], files)],
             "printf '%s\\n' " + " ".join(_q(f"{w['sha256']}  {f}") for w, f in zip(pk["wheels"], files)) + ' > "$w/SHA256SUMS"',
             '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
             "printf '%s\\n' " + " ".join(_q(f"{w['name']}=={w['version']} --hash=sha256:{w['sha256']}") for w in pk["wheels"]) + ' > "$w/requirements.lock.txt"',
-            f"{_q('./' + rt['python'])} -I -m pip --isolated install --no-index --find-links \"$w\" --only-binary :all: --require-hashes "
-            '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --disable-pip-version-check',
+            _PIPENV,
+            f"(pipenv \"$s\"; exec {_q('./' + rt['python'])} -I -m pip --isolated install --no-index --find-links \"$w\" --only-binary :all: --require-hashes "
+            '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --no-cache-dir --disable-pip-version-check)',
             f"nolink {t} {d}",
             _KEEP,
             'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; '
