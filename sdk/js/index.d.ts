@@ -4,7 +4,9 @@ export type Launch = { image: string; entrypoint: string | null; args: string[];
   kind?: string; command?: string[]; install?: string; pip?: string[]; runtime?: Runtime };
 /** A host `layout: "hub"` weights entry is a Hugging Face cache under `at`; `ref` (e.g. "main") is then written to name `revision`. */
 export type Weights = { repo: string; revision: string; at: string; layout?: string; files?: string | string[] | null; ref?: string };
-/** A pinned host runtime (host launches only, never with `pip`): an interpreter archive and/or a hash-locked offline wheel set. */
+/** A pinned host runtime (host launches only, never with `pip`): an interpreter archive, its interpreter (a relative path
+ *  inside `archive.into`) and a hash-locked offline wheel set; `dir` and `target` must not overlap. A launch with weights
+ *  needs `layout: "hub"` weights and a `huggingface-hub` wheel. `steps` throws on anything else (docs/design.md). */
 export type Runtime = {
   archive?: { url: string; sha256: string; into: string };
   python?: string;
