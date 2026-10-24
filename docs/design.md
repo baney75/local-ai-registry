@@ -64,6 +64,8 @@ step first refuses a symlink at its destination or at any directory above it, an
 into place. A file (`refs/<ref>`, the launcher) is written to an exclusive `mktemp` file in its checked directory and
 renamed over the destination only if that is neither a link nor a directory.
 
+Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is read).
+
 - `archive: {url, sha256, into}`: an `https` `.tar.gz` or `.tgz` (the file name is the URL's last segment, percent-decoded,
   so `%2B` is `+`). It is downloaded into a fresh directory inside `into`, checked with `shasum -a 256 -c` and extracted
   there. Before anything live is touched, no member name may be absolute or contain `..`; every link in the extracted tree
@@ -78,16 +80,20 @@ renamed over the destination only if that is neither a link nor a directory.
 - `packages: {dir, target, wheels: [{name, version, url, sha256}]}` (needs `python`; `dir` and `target` do not overlap):
   every wheel is downloaded into a fresh directory beside `dir` and checked against its hash, then installed offline into a
   fresh directory beside `target` with
-  `./<python> -I -m pip --isolated install --no-index --find-links <wheels> --only-binary :all: --require-hashes -r requirements.lock.txt --target <fresh>`.
+  `./<python> -I -m pip --isolated install --no-index --find-links <wheels> --only-binary :all: --require-hashes -r requirements.lock.txt --target <fresh> --no-cache-dir`,
+  with `PIP_CONFIG_FILE=/dev/null` (which turns off every pip config file; `--isolated` alone does not) and `TMPDIR`, `TMP`,
+  `TEMP`, `HOME`, `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` inside the staging directory, which is removed afterwards.
   The lock lists exactly these wheels, so a missing or extra dependency fails the install. Only after the install succeeds
   do the fresh directories replace `target` and `dir` by rename, so `target` holds exactly the pinned wheels (nothing left
   from an earlier install); a failure, including a failed rename, leaves the previous `target` and `dir` as they were.
 
 A host weights entry with `layout: "hub"` is a Hugging Face cache at `at`; one launch's host weights are all hub or all
-directories. With a pinned runtime, `runtime.packages` must include `huggingface_hub`, and the download runs on the pinned
+directories. Entries may share a cache only when their `at` is the same path; distinct caches never nest. A repo appears
+at most once per cache (a second entry, for another revision or other files, is rejected), because each publish replaces
+the repo's whole model directory. Paths are compared ignoring case, as macOS file systems do. With a pinned runtime, `runtime.packages` must include `huggingface_hub`, and the download runs on the pinned
 interpreter with `target` on its path (`snapshot_download(..., token=False)`), so the machine needs no `hf`. Without one
 it is `hf download`. Either way the download goes into a fresh staging cache beside `at`, with every `HF_*` and
-`HUGGING_FACE_*` variable and `NETRC` removed and `HOME`, `HF_HOME` and `HF_XET_CACHE` inside that staging cache, so no
+`HUGGING_FACE_*` variable and `NETRC` removed and `HOME`, `HF_HOME`, `HF_XET_CACHE` and `TMPDIR` inside that staging cache, so no
 ambient token, config, cache or `.netrc` is used, and nothing already in `at` (a planted `blobs` or `refs` link) is written
 through. In the staged cache `models--<org>--<name>/snapshots/<revision>` must exist and every link must stay inside the
 model directory (the same check as the archive); with `ref` (for example `main`) a `refs/<ref>` file is written to name
