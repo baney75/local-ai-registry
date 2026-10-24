@@ -71,7 +71,8 @@ Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is r
   there. Before anything live is touched, no member name may be absolute or contain `..`; every link in the extracted tree
   must be relative, not dangling, and resolve inside it (safe internal links such as `python3 -> python3.12` are kept);
   every hard link must stay inside it; it may hold no device, fifo, socket or set-id file; every top-level entry must have
-  a plain name, must not be a link in `into`, and must not hold another step's destination; and the staged interpreter
+  a plain name, must not be a link in `into`, and must not hold another step's destination, compared ignoring case (an
+  entry `SITE` holds `rt/site`, and so does `site` when the target is `RT/site`); and the staged interpreter
   (so resolved inside the archive) must exist and run. Only then does each entry replace the
   one in `into` by rename. If a rename fails, every entry already moved is put back, so the previous runtime stays whole
   and usable; if putting it back fails too, the previous copy is kept (not deleted) and the step says where. Other files in
@@ -90,7 +91,11 @@ Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is r
 A host weights entry with `layout: "hub"` is a Hugging Face cache at `at`; one launch's host weights are all hub or all
 directories. Entries may share a cache only when their `at` is the same path; distinct caches never nest. A repo appears
 at most once per cache (a second entry, for another revision or other files, is rejected), because each publish replaces
-the repo's whole model directory. Paths are compared ignoring case, as macOS file systems do. With a pinned runtime, `runtime.packages` must include `huggingface_hub`, and the download runs on the pinned
+the repo's whole model directory. Paths are compared ignoring case, as macOS file systems do.
+
+A host launch with a runtime or with hub weights is confined, so its launcher (`config.at`) must be a plain relative path
+that overlaps no other destination, and is written by the same guarded writer (an exclusive temp file renamed into
+place, never through a link). A host launch with directory weights and no runtime renders its launcher as before. With a pinned runtime, `runtime.packages` must include `huggingface_hub`, and the download runs on the pinned
 interpreter with `target` on its path (`snapshot_download(..., token=False)`), so the machine needs no `hf`. Without one
 it is `hf download`. Either way the download goes into a fresh staging cache beside `at`, with every `HF_*` and
 `HUGGING_FACE_*` variable and `NETRC` removed and `HOME`, `HF_HOME`, `HF_XET_CACHE` and `TMPDIR` inside that staging cache, so no
