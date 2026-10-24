@@ -87,12 +87,16 @@ S=$FAKE_STATE/c; mkdir -p "$S"
 while [[ "${1:-}" == --root || "${1:-}" == --runroot || "${1:-}" == --tmpdir ]]; do shift 2; done
 echo "$*" >> "$FAKE_STATE/calls"
 label_of() { sed -n 's/^sybil.run=//p' "$S/$1/labels" 2>/dev/null; }
+case ",${FAKE_HANG:-}," in *",$1,"*) [ -e "$FAKE_STATE/started" ] && { trap '' TERM; exec sleep 100000; } ;; esac
 alive() { [ -f "$S/$1/pid" ] && kill -0 "$(cat "$S/$1/pid")" 2>/dev/null; }
 stop() { [ -f "$S/$1/pid" ] && { kill -9 -- "-$(cat "$S/$1/pid")" 2>/dev/null; kill -9 "$(cat "$S/$1/pid")" 2>/dev/null; rm -f "$S/$1/pid"; }; }
 case "$1" in
   image)
-    case "$2" in exists) exit 0 ;; inspect) echo "$FAKE_DIGEST" ;; esac ;;
-  pull) exit 0 ;;
+    case "$2" in
+      exists) [ -n "${FAKE_IMAGE_ABSENT:-}" ] && [ ! -e "$FAKE_STATE/pulled" ] && exit 1; exit 0 ;;
+      inspect) echo "$FAKE_DIGEST" ;;
+    esac ;;
+  pull) touch "$FAKE_STATE/pulled"; exit 0 ;;
   run)
     shift; cid=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'); labels=(); port=
     while [ $# -gt 0 ]; do
@@ -106,6 +110,7 @@ case "$1" in
       esac
     done
     [ -n "${FAKE_RUN_FAIL:-}" ] && exit 125
+    touch "$FAKE_STATE/started"
     mkdir -p "$S/$cid"; printf '%s\n' "${labels[@]}" > "$S/$cid/labels"; echo "$name" > "$S/$cid/name"
     setsid "$FAKE_PY" "$FAKE_TEST" --serve "$port" "${FAKE_FAULTS:-}" > "$S/$cid/out.log" 2>&1 < /dev/null &
     echo $! > "$S/$cid/pid"
@@ -138,8 +143,15 @@ exit 0
 '''
 
 NVSMI = r'''#!/usr/bin/env bash
+echo "nvidia-smi $*" >> "$FAKE_STATE/calls"
+[ -n "${FAKE_NVSMI_HANG_AFTER_RUN:-}" ] && [ -e "$FAKE_STATE/started" ] && { trap '' TERM; exec sleep 100000; }
 case "$*" in
-  *query-compute-apps*) [ -n "${FAKE_GPU_APPS:-}" ] && echo "$FAKE_GPU_APPS"; exit 0 ;;
+  *query-compute-apps*) [ -n "${FAKE_COMPUTE_FAIL:-}" ] && exit 1; [ -n "${FAKE_GPU_APPS:-}" ] && echo "$FAKE_GPU_APPS"; exit 0 ;;
+  "--query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits")
+    [ -n "${FAKE_UTIL_HANG:-}" ] && { trap '' TERM; exec sleep 100000; }
+    [ -n "${FAKE_UTIL_FAIL:-}" ] && exit 1
+    [ -n "${FAKE_BUSY_AFTER_PULL:-}" ] && [ -e "$FAKE_STATE/pulled" ] && { echo "99, 9000"; exit 0; }
+    printf '%s\n' "${FAKE_UTIL:-3, 52}"; exit 0 ;;
   "--query-gpu=name --format=csv,noheader") echo "${FAKE_GPU_NAME:-NVIDIA GeForce RTX 4080 Laptop GPU}" ;;
   "--query-gpu=driver_version --format=csv,noheader") echo 610.57.04 ;;
   *) echo "fake nvidia-smi $*" ;;
@@ -179,7 +191,9 @@ class Repro(unittest.TestCase):
             p = os.path.join(self.bin, name); open(p, "w").write(text); os.chmod(p, 0o755)
         self.state = os.path.join(self.t, "state"); os.makedirs(os.path.join(self.state, "c"))
         self.store = os.path.join(self.t, "store")
-        self.env = {**os.environ, "PATH": self.bin + ":" + os.environ["PATH"], "FAKE_STATE": self.state, "FAKE_PY": sys.executable,
+        self.home = os.path.join(self.t, "home"); os.makedirs(self.home)
+        path = ":".join(d for d in os.environ["PATH"].split(":") if ".local/bin" not in d and "mise" not in d)  # no real parish-media
+        self.env = {**os.environ, "HOME": self.home, "PATH": self.bin + ":" + path, "FAKE_STATE": self.state, "FAKE_PY": sys.executable,
                     "FAKE_TEST": os.path.join(self.repo, REL, "test_repro.py"), "FAKE_DIGEST": DIGEST, "MODEL_DIR": self.model, "STORE": self.store,
                     "LIBDIR": self.libdir, "SERVER_PORT": str(free_port()), "REC_PORT": str(free_port()), "PYTHON": sys.executable,
                     "HEALTH_TIMEOUT": "60", "LAB_TIMEOUT": "300", "REPEAT_TIMEOUT": "120", "REPRO_TIMEOUT": "600"}
@@ -199,8 +213,10 @@ class Repro(unittest.TestCase):
         shutil.rmtree(self.t, ignore_errors=True)
 
     def run_repro(self, timeout=900, **env):
+        t0 = time.monotonic()
         r = subprocess.run(["bash", os.path.join(self.repo, REL, "repro.sh")], env={**self.env, **env}, capture_output=True, text=True, timeout=timeout)
         self.out = r.stdout + r.stderr
+        self.elapsed = time.monotonic() - t0
         return r.returncode
 
     def ours(self):
@@ -313,6 +329,80 @@ class Repro(unittest.TestCase):
     def test_overall_timeout_cleans_up(self):
         rc = self.run_repro(FAKE_FAULTS="hang_context", REPRO_TIMEOUT="25")
         self.assertIn(rc, (124, 143), self.out[-2000:]); self.assertIn("cleanup", self.out); self.assertClean()
+
+    # ---- idle / no-gaming policy (Sol r2 finding 2): never start a container on a busy or unknown GPU
+    def assertBusy(self, needle, **env):
+        rc = self.run_repro(**env)
+        self.assertEqual(rc, 3, self.out[-2000:]); self.assertIn(needle, self.out)
+        self.assertNotIn("run -d", self.calls()); self.assertClean()
+
+    def test_graphics_busy_compute_empty(self):
+        self.assertBusy("GPU busy: 99% utilization", FAKE_UTIL="99, 3000")
+
+    def test_busy_after_pull(self):
+        self.assertBusy("launch: GPU not idle", FAKE_IMAGE_ABSENT="1", FAKE_BUSY_AFTER_PULL="1")
+        self.assertIn("pull ", self.calls())
+
+    def test_util_malformed(self):
+        self.assertBusy("malformed", FAKE_UTIL="[N/A], 52")
+
+    def test_util_two_lines(self):
+        self.assertBusy("malformed", FAKE_UTIL="3, 52\n4, 60")
+
+    def test_util_timeout_bounded(self):
+        self.assertBusy("failed or timed out", FAKE_UTIL_HANG="1")
+        self.assertLess(self.elapsed, 60)
+
+    def test_util_query_fails(self):
+        self.assertBusy("failed or timed out", FAKE_UTIL_FAIL="1")
+
+    def test_compute_query_fails(self):
+        self.assertBusy("compute query failed", FAKE_COMPUTE_FAIL="1")
+
+    def power(self, ac):
+        d = os.path.join(self.t, "power")
+        for name, ty, online in (("BAT0", "Battery", None), ("AC", "Mains", ac)):
+            os.makedirs(os.path.join(d, name), exist_ok=True)
+            open(os.path.join(d, name, "type"), "w").write(ty + "\n")
+            if online is not None:
+                open(os.path.join(d, name, "online"), "w").write(online + "\n")
+        return d
+
+    def test_on_battery(self):
+        self.assertBusy("not on AC power", SYBIL_TEST_POWER_DIR=self.power("0"))
+
+    def test_power_override_never_qualifies(self):
+        rc = self.run_repro(SYBIL_TEST_POWER_DIR=self.power("1"))
+        self.assertEqual(rc, 10, self.out[-2000:]); self.assertIn("cannot qualify", self.out); self.assertClean()
+
+    def parish_media(self, out, code):
+        d = os.path.join(self.t, "pm"); os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "parish-media"); open(p, "w").write(f"#!/bin/sh\ncat <<'EOF'\n{out}\nEOF\nexit {code}\n"); os.chmod(p, 0o755)
+        return d + ":" + self.env["PATH"]
+
+    def test_parish_media_not_ready(self):
+        self.assertBusy("parish-media guard not ready", PATH=self.parish_media(json.dumps({"ac_online": True, "not_ready": "GPU is in use"}), 0))
+
+    def test_parish_media_command_fails(self):
+        self.assertBusy("parish-media status failed", PATH=self.parish_media(json.dumps({"ac_online": True, "not_ready": None}), 1))
+
+    def test_parish_media_ready(self):
+        rc = self.run_repro(PATH=self.parish_media(json.dumps({"ac_online": True, "not_ready": None}), 0))
+        self.assertEqual(rc, 0, self.out[-2000:]); self.assertClean()
+
+    # ---- cleanup reserve (Sol r2 finding 1): every cleanup step hangs to its bound; cleanup still reaches its verdict
+    def test_worst_case_cleanup_reaches_verdict(self):
+        rc = self.run_repro(timeout=900, FAKE_FAULTS="hang_context", REPRO_TIMEOUT="20",
+                            FAKE_HANG="logs,rm,kill,container", FAKE_NVSMI_HANG_AFTER_RUN="1")
+        self.assertEqual(rc, 124, self.out[-3000:])  # TERMed by the overall bound, never KILLed (137)
+        import re
+        m = re.search(r"cleanup verdict: ok=0 after (\d+)s of (\d+)s", self.out)
+        self.assertTrue(m, self.out[-3000:])
+        used, reserve = int(m.group(1)), int(m.group(2))
+        self.assertGreater(used, 100)  # the hung steps really ran to their bounds
+        self.assertLess(used, reserve)
+        self.assertIn("NOT removed", self.out)
+        self.assertLess(self.elapsed, 20 + reserve)
 
     def test_container_start_failure(self):
         self.assertEqual(self.run_repro(FAKE_RUN_FAIL="1"), 5); self.assertClean()
