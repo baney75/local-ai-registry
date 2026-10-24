@@ -137,20 +137,25 @@ sys.path.insert(0, "lab")
 import test_host_runtime as T
 import copy
 full = T.launch()
-shapes = {"full": full, "archive only": {**full, "runtime": {"archive": full["runtime"]["archive"]}},
-    "packages without archive": {**full, "runtime": {k: full["runtime"][k] for k in ("python", "packages")}},
+shapes = {"full": full,
+    "archive and python, nothing to download": {**full, "runtime": {k: full["runtime"][k] for k in ("archive", "python")}, "weights": [], "config": None},
+    "no launcher": {**full, "config": None},
     "hub without ref": {**full, "weights": [{k: v for k, v in full["weights"][0].items() if k != "ref"}]},
-    "hub with files": {**full, "weights": [{**full["weights"][0], "files": ["config.json", "model.safetensors"]}]}}
+    "hub with files": {**full, "weights": [{**full["weights"][0], "files": ["config.json", "model.safetensors"]}]},
+    "two hub weights in one cache": {**full, "weights": [full["weights"][0], {**full["weights"][0], "repo": "org/draft", "revision": "c" * 40}]},
+    "nested under one directory": T.launch(root="opt/rt"),
+    "hub weights without a runtime": {k: v for k, v in full.items() if k != "runtime"}}
 cases = {**{f"ok: {k}": {"model": "rt", "launch": v} for k, v in shapes.items()},
          **{f"bad: {k}": {"model": "rt", "launch": make()} for k, make in T.BAD.items()}}
 js = json.loads(subprocess.run(["node", "--input-type=module", "-e", """
-import { readFileSync } from "node:fs"; import { steps } from "./sdk/js/index.js";
+import { readFileSync } from "node:fs"; import { steps, command } from "./sdk/js/index.js";
 const out = {}; for (const [k, r] of Object.entries(JSON.parse(readFileSync(0, "utf8")))) {
-  try { out[k] = steps(r); } catch (e) { out[k] = { threw: String(e.message) }; } }
+  try { out[k] = [steps(r), command(r)]; } catch (e) { out[k] = { threw: String(e.message) }; } }
 console.log(JSON.stringify(out));"""], input=json.dumps(cases), capture_output=True, text=True, check=True).stdout)
 for k, r in cases.items():
     if k.startswith("ok: "):
-        assert js[k] == L.steps(copy.deepcopy(r)), f"js and python steps differ for runtime {k}"
+        assert js[k] == [L.steps(copy.deepcopy(r)), L.command(copy.deepcopy(r))], f"js and python differ for runtime {k}"
+        assert js[k][1].startswith("set -e\n\n"), f"command for {k} does not stop at the first failure"
     else:
         assert "threw" in js[k] and js[k]["threw"].startswith("invalid host runtime"), f"js renders {k}: {js[k]}"
         try:

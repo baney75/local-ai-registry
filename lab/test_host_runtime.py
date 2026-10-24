@@ -1,5 +1,7 @@
 """The optional pinned host runtime (docs/design.md, "A pinned host runtime"): validation, pins, rendered steps, and the
-steps themselves run in a sandbox with real shasum, tar and pip and stand-ins for curl and hf (no network)."""
+steps themselves run in a sandbox with real shasum, tar, mktemp and pip and stand-ins for curl (no network). The whole
+one-script command from both SDKs is run under bash, bash -e and sh."""
+import base64
 import contextlib
 import copy
 import hashlib
@@ -17,7 +19,8 @@ import zipfile
 
 import lab
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'sdk' / 'python'))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'sdk' / 'python'))
 import local_ai_registry as sdk  # noqa: E402
 
 REV = '0123456789abcdef0123456789abcdef01234567'
@@ -25,6 +28,8 @@ ARCHIVE = 'cpython-3.12.15+20261021-aarch64-apple-darwin-install_only.tar.gz'
 ARCHIVE_URL = 'https://github.com/astral-sh/python-build-standalone/releases/download/20261021/' + ARCHIVE.replace('+', '%2B')
 WHEEL_URL = 'https://files.example.invalid/packages/'
 KEYS = ('command', 'install', 'pip', 'env', 'port', 'weights', 'ctx', 'seqs', 'vision', 'wired_limit_reserve_mb')
+SHAS = ('1' * 64, '2' * 64, '3' * 64, '4' * 64)
+SERVER = 'open("SERVER_STARTED", "w").write("ok")\n'
 
 
 def before(p):
@@ -37,24 +42,25 @@ def wheel(name, version, sha):
     return {'name': name, 'version': version, 'url': f"{WHEEL_URL}{name.replace('-', '_')}-{version}-py3-none-any.whl", 'sha256': sha}
 
 
-def runtime(shas=('1' * 64, '2' * 64, '3' * 64)):
-    return {'archive': {'url': ARCHIVE_URL, 'sha256': shas[0], 'into': 'rt'}, 'python': 'rt/python/bin/python3',
-            'packages': {'dir': 'rt/wheels', 'target': 'rt/site',
-                         'wheels': [wheel('fixture-a', '1.0', shas[1]), wheel('fixture-b', '2.0', shas[2])]}}
+def runtime(shas=SHAS, root='rt'):
+    return {'archive': {'url': ARCHIVE_URL, 'sha256': shas[0], 'into': root}, 'python': f'{root}/python/bin/python3',
+            'packages': {'dir': f'{root}/wheels', 'target': f'{root}/site',
+                         'wheels': [wheel('fixture-a', '1.0', shas[1]), wheel('fixture-b', '2.0', shas[2]), wheel('huggingface-hub', '1.0', shas[3])]}}
 
 
-def profile(rt=None):
-    """A host profile shaped like the Apple MLX ones, with a pinned runtime and Hugging Face cache weights."""
+def profile(rt=None, root='rt', launcher='launcher'):
+    """A host profile shaped like the Apple MLX ones: a pinned runtime, Hugging Face cache weights and a launcher."""
     return {'id': 'fixture-runtime', 'kind': 'host', 'engine': 'mlx-lm', 'backend': 'metal', 'port': 8080, 'ctx': 32768, 'seqs': 1,
-            'vision': False, 'install': 'Task runtime: rt/ (see runtime)', 'runtime': runtime() if rt is None else rt,
-            'command': ['rt/python/bin/python3', '-I', '-m', 'mlx_lm', 'server', '--model', 'org/model', '--host', '127.0.0.1', '--port', '8080'],
-            'env': {'PYTHONPATH': 'rt/site', 'HF_HUB_CACHE': 'rt/hf-cache', 'HF_HUB_OFFLINE': '1'},
-            'weights': [{'repo': 'org/model', 'revision': REV, 'at': 'rt/hf-cache', 'layout': 'hub', 'files': None, 'ref': 'main'}]}
+            'vision': False, 'install': f'Task runtime: {root}/ (see runtime)', 'runtime': runtime(root=root) if rt is None else rt,
+            'command': [f'{root}/python/bin/python3', '-I', f'{launcher}/serve.py', '--port', '8080'],
+            'env': {'PYTHONPATH': f'{root}/site', 'HF_HUB_CACHE': f'{root}/hf-cache', 'HF_HUB_OFFLINE': '1'},
+            'weights': [{'repo': 'org/model', 'revision': REV, 'at': f'{root}/hf-cache', 'layout': 'hub', 'files': None, 'ref': 'main'}],
+            'config': {'at': f'{launcher}/serve.py', 'text': SERVER}}
 
 
-def launch(rt=None):
+def launch(rt=None, **kw):
     """The rendered launch, as the SDKs see it in dist/catalog.json."""
-    p = profile(rt)
+    p = profile(rt, **kw)
     with patch.object(lab, 'profile', return_value=p):
         return lab.render({'model': 'test-model', 'weights': 'org/model@' + REV, 'engine': 'fixture-runtime@host', 'set': {}, 'card': 'apple-m1-8gb'})
 
@@ -74,6 +80,17 @@ def edit(path, value):
         return L
     return make
 
+
+def without_runtime(change):
+    def make():
+        L = launch()
+        del L['runtime']
+        change(L)
+        return L
+    return make
+
+
+DIR_WEIGHTS = {'repo': 'org/other', 'revision': 'f' * 40, 'at': 'models/other', 'layout': 'dir', 'files': None}
 
 # Rejected by lab.py check and by both SDKs (sdk/test.sh runs this table through the JS SDK too).
 BAD = {
@@ -100,11 +117,18 @@ BAD = {
     'into is empty': edit(['runtime', 'archive', 'into'], ''),
     'python is absolute': edit(['runtime', 'python'], '/usr/bin/python3'),
     'python has $()': edit(['runtime', 'python'], '$(id)/python3'),
+    'python is a bare name (PATH lookup)': edit(['runtime', 'python'], 'python3'),
+    'python outside the archive': edit(['runtime', 'python'], 'other/bin/python3'),
+    'python is the archive dir itself': edit(['runtime', 'python'], 'rt'),
+    'python without an archive': edit(['runtime', 'archive'], ...),
     'packages without python': edit(['runtime', 'python'], ...),
     'packages extra key': edit(['runtime', 'packages', 'index'], 'https://pypi.org/simple'),
     'packages without target': edit(['runtime', 'packages', 'target'], ...),
     'target is absolute': edit(['runtime', 'packages', 'target'], '/Library/Python'),
     'dir climbs': edit(['runtime', 'packages', 'dir'], 'rt/../..'),
+    'dir inside target': edit(['runtime', 'packages', 'dir'], 'rt/site/wheels'),
+    'target inside dir': edit(['runtime', 'packages', 'target'], 'rt/wheels/site'),
+    'dir is target': edit(['runtime', 'packages', 'dir'], 'rt/site'),
     'no wheels': edit(['runtime', 'packages', 'wheels'], []),
     'wheels not a list': edit(['runtime', 'packages', 'wheels'], {'a': 1}),
     'wheel extra key': edit(['runtime', 'packages', 'wheels', 0, 'extras'], 'cli'),
@@ -118,6 +142,12 @@ BAD = {
     'wheel version has ;': edit(['runtime', 'packages', 'wheels', 0, 'version'], '1.0;id'),
     'wheel listed twice': edit(['runtime', 'packages', 'wheels', 1], wheel('fixture-a', '1.0', '2' * 64)),
     'wheel listed twice under another spelling': edit(['runtime', 'packages', 'wheels', 1], wheel('Fixture_A', '1.0', '2' * 64)),
+    'weights without a pinned huggingface_hub': edit(['runtime', 'packages', 'wheels', 2], wheel('fixture-c', '1.0', '4' * 64)),
+    'weights with a runtime that has no packages': edit(['runtime', 'packages'], ...),
+    'directory weights with a runtime': edit(['weights', 0], DIR_WEIGHTS),
+    'hub and directory weights mixed': without_runtime(lambda L: L['weights'].append(DIR_WEIGHTS)),
+    'launcher path is absolute': edit(['config', 'at'], '/tmp/serve.py'),
+    'launcher path climbs': edit(['config', 'at'], '../serve.py'),
     'runtime extra key': edit(['runtime', 'post'], 'echo hi'),
     'runtime empty': edit(['runtime'], {}),
     'runtime not an object': edit(['runtime'], 'rt/python/bin/python3'),
@@ -149,6 +179,28 @@ def lab_rejects(L):
     return False
 
 
+NODE = shutil.which('node')
+# bash (what the site's one command runs), sh, and dash (sh on Debian and Ubuntu) when installed
+SHELLS = [('bash', '-c'), ('bash', '-ec'), ('sh', '-c')] + ([('dash', '-c')] if shutil.which('dash') else [])
+
+
+def js(fn, L):
+    """`steps` or `command` from the JS SDK for the same launch."""
+    out = subprocess.run([NODE, '--input-type=module', '-e',
+                          f'import {{readFileSync}} from "node:fs"; const m = await import(process.argv[1]); '
+                          f'console.log(JSON.stringify(m.{fn}(JSON.parse(readFileSync(0, "utf8")))));', str(ROOT / 'sdk/js/index.js')],
+                         input=json.dumps({'model': 'test-model', 'launch': L}), capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def renderings(L, fn='steps'):
+    """Each SDK's output for one launch: Python always, JS when node is installed."""
+    out = {'python': getattr(sdk, fn)({'model': 'test-model', 'launch': L})}
+    if NODE:
+        out['js'] = js(fn, L)
+    return out
+
+
 class ContractTest(unittest.TestCase):
     def test_fixture_passes(self):
         lab.check_host_runtime(launch())
@@ -164,10 +216,9 @@ class ContractTest(unittest.TestCase):
                 sdk.steps({'model': 'test-model', 'launch': make()})
 
     def test_launches_without_the_fields_are_untouched(self):
-        # no registry profile uses the fields yet; every rendered launch still passes, and its steps never mention them
+        # no registry profile uses the fields yet; every rendered launch still passes
         for f in sorted(lab.RECIPES.rglob('*.json')):
-            r = json.loads(f.read_text())
-            L = lab.render(r)
+            L = lab.render(json.loads(f.read_text()))
             self.assertNotIn('runtime', L, f.name)
             lab.check_host_runtime(L)
 
@@ -199,8 +250,7 @@ class PinTest(unittest.TestCase):
         without = {k: v for k, v in p.items() if k != 'runtime'}
         self.assertEqual(lab.pin(without), before(without))
         self.assertNotEqual(lab.pin(p), lab.pin(without))
-        other = profile(runtime(('1' * 64, '2' * 64, '4' * 64)))
-        self.assertNotEqual(lab.pin(p), lab.pin(other))  # one wheel hash
+        self.assertNotEqual(lab.pin(p), lab.pin(profile(runtime(('1' * 64, '2' * 64, '5' * 64, '4' * 64)))))  # one wheel hash
         moved = copy.deepcopy(p); moved['weights'][0]['ref'] = 'v1'
         self.assertNotEqual(lab.pin(p), lab.pin(moved))  # the task-local ref
 
@@ -212,29 +262,39 @@ class StepsTest(unittest.TestCase):
 
     def test_titles(self):
         self.assertEqual([s['title'] for s in self.steps],
-                         ['Install the runtime', 'Install the packages', 'Download the weights', 'Start the server'])
+                         ['Install the runtime', 'Install the packages', 'Download the weights', 'Write the launcher', 'Start the server'])
 
-    def test_no_prose_and_no_flat_weights(self):
+    def test_every_setup_step_is_one_strict_subshell(self):
+        for s in self.steps[:-1]:
+            self.assertTrue(s['code'].startswith('(\nset -e\n') and s['code'].endswith('\n)'), s['title'])
+
+    def test_command_stops_at_the_first_failure(self):
+        for name, c in renderings(launch(), 'command').items():
+            self.assertTrue(c.startswith('set -e\n\n'), name)
+
+    def test_no_prose_no_flat_weights_no_ambient_tools(self):
         code = '\n'.join(s['code'] for s in self.steps)
         self.assertNotIn('Task runtime', code)  # the free-text install is not rendered when runtime is pinned
-        self.assertFalse([line for line in code.splitlines() if line.lstrip().startswith('#')])
-        self.assertNotIn('--local-dir', self.by['Download the weights'])
-        self.assertIn('--cache-dir rt/hf-cache', self.by['Download the weights'])
+        self.assertNotIn('--local-dir', code)
+        self.assertNotIn('hf download', code)
+        self.assertIn("./rt/python/bin/python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download",
+                      self.by['Download the weights'])
+        self.assertIn('./rt/python/bin/python3 -I -m pip --isolated install', self.by['Install the packages'])
 
     def test_archive_is_checked_before_extracting(self):
         code = self.by['Install the runtime']
-        self.assertIn(f'curl -fL -o {ARCHIVE} {ARCHIVE_URL}', code)
+        self.assertIn(f'curl -fL -o "$s"/{ARCHIVE} {ARCHIVE_URL}', code)
         self.assertLess(code.index('shasum -a 256 -c'), code.index('tar -xzf'))
-        self.assertIn(' && \\\n', code)
 
-    def test_packages_are_hash_locked_and_offline(self):
+    def test_packages_are_hash_locked_offline_and_staged(self):
         code = self.by['Install the packages']
-        for flag in ('-I -m pip install', '--no-index', '--only-binary :all:', '--require-hashes', '--target rt/site'):
+        for flag in ('--no-index', '--only-binary :all:', '--require-hashes', '--target "$s/t"'):
             self.assertIn(flag, code)
-        self.assertLess(code.index('shasum -a 256 -c SHA256SUMS'), code.index('pip install'))
+        self.assertLess(code.index('shasum -a 256 -c SHA256SUMS'), code.index('pip --isolated install'))
+        self.assertLess(code.index('pip --isolated install'), code.index('mv "$s/t" rt/site'))
 
     def test_existing_shapes_unchanged(self):
-        # without the new fields: the old install, pip and --local-dir rendering
+        # without the new fields: the old install, pip, --local-dir and launcher rendering, and no `set -e` in command()
         L = launch()
         del L['runtime']
         L['pip'] = ['mlx-lm==0.31.3']
@@ -242,24 +302,37 @@ class StepsTest(unittest.TestCase):
         st = {s['title']: s['code'] for s in sdk.steps({'model': 'test-model', 'launch': L})}
         self.assertEqual(st['Install the engine'], 'python3 -m pip install mlx-lm==0.31.3')
         self.assertEqual(st['Download the weights'], f'hf download org/model \\\n  --revision {REV} \\\n  --local-dir models/model')
+        self.assertEqual(st['Write the launcher'], f"mkdir -p launcher\ncat > launcher/serve.py <<'EOF'\n{SERVER.rstrip()}\nEOF")
+        self.assertFalse(sdk.command({'model': 'test-model', 'launch': L}).startswith('set -e'))
 
 
-def make_wheel(d, name, version, requires=()):
+def make_wheel(d, name, version, requires=(), module='VERSION = 1\n'):
     """A minimal pure-Python wheel that pip will install."""
     dist = name.replace('-', '_')
     f = Path(d) / f'{dist}-{version}-py3-none-any.whl'
     info = f'{dist}-{version}.dist-info'
-    files = {f'{dist}/__init__.py': f'VERSION = {version!r}\n',
+    files = {f'{dist}/__init__.py': module,
              f'{info}/METADATA': f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n' + ''.join(f'Requires-Dist: {r}\n' for r in requires),
              f'{info}/WHEEL': 'Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n'}
-    record = ''.join(f"{k},sha256={__import__('base64').urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b'=').decode()},{len(v.encode())}\n"
-                     for k, v in files.items()) + f'{info}/RECORD,,\n'
+    digest = lambda v: base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b'=').decode()
+    record = ''.join(f'{k},sha256={digest(v)},{len(v.encode())}\n' for k, v in files.items()) + f'{info}/RECORD,,\n'
     with zipfile.ZipFile(f, 'w') as z:
         for k, v in {**files, f'{info}/RECORD': record}.items():
             z.writestr(k, v)
     return f
 
 
+# The pinned huggingface_hub stand-in: makes the snapshot (unless FAKE_HF_MISS) and records which copy ran.
+HUB = '''import os
+def snapshot_download(repo_id, revision=None, cache_dir=None, allow_patterns=None):
+    open("HUB_USED", "w").write(os.path.abspath(__file__))
+    if os.environ.get("FAKE_HF_MISS"):
+        return cache_dir
+    snap = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"), "snapshots", revision)
+    os.makedirs(snap, exist_ok=True)
+    open(os.path.join(snap, "config.json"), "w").write("{}")
+    return snap
+'''
 FAKE_CURL = '''#!/bin/sh
 # curl -fL -o FILE URL: copy the URL's file from $FAKE_SERVER, or fail like curl -f on a 404
 out=; url=
@@ -268,103 +341,222 @@ name=$(printf '%s' "${url##*/}" | sed 's/%2B/+/g')
 [ -f "$FAKE_SERVER/$name" ] || exit 22
 cp "$FAKE_SERVER/$name" "$out"
 '''
-FAKE_HF = '''#!/bin/sh
-# hf download REPO --revision REV --cache-dir DIR: make the snapshot unless $FAKE_HF_MISS (a download that left none)
-repo=$2; rev=; dir=
-while [ $# -gt 0 ]; do case "$1" in --revision) rev=$2; shift 2;; --cache-dir) dir=$2; shift 2;; *) shift;; esac; done
-[ -n "$FAKE_HF_MISS" ] && exit 0
-snap="$dir/models--$(printf '%s' "$repo" | sed 's#/#--#')/snapshots/$rev"
-mkdir -p "$snap" && echo '{}' > "$snap/config.json"
-'''
+# Anything looked up on PATH or planted in the working directory instead of the pinned runtime: record it and fail.
+TRAP = '#!/bin/sh\necho "$0 $*" >> "$TRAPPED"\nexit 73\n'
 
 
-@unittest.skipUnless(shutil.which('shasum') and shutil.which('tar') and shutil.which('sh'), 'needs shasum, tar and sh')
+def tree(p):
+    """Every file and link under p with its content hash or target, so two trees compare exactly."""
+    p = Path(p)
+    if not p.exists() and not p.is_symlink():
+        return None
+    return {str(f.relative_to(p)): ('link:' + os.readlink(f)) if f.is_symlink() else
+            hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else 'dir' for f in sorted(p.rglob('*'))}
+
+
+def staging_left(p):
+    return [str(f) for f in Path(p).rglob('*') if '.local-ai-' in f.name]
+
+
+@unittest.skipUnless(shutil.which('shasum') and shutil.which('tar') and shutil.which('bash') and shutil.which('mktemp')
+                     and subprocess.run([sys.executable, '-I', '-m', 'pip', '--version'], capture_output=True).returncode == 0,
+                     'needs shasum, tar, bash, mktemp and pip')
 class SandboxTest(unittest.TestCase):
-    """Run the rendered steps for real in a temp directory: real shasum, tar and pip; curl and hf read local files."""
+    """Run the rendered steps for real in a temp directory: real shasum, tar, mktemp and pip; curl reads local files."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        d = Path(self.tmp.name)
-        self.work, self.server, self.bin = d / 'work', d / 'server', d / 'bin'
-        for p in (self.work, self.server, self.bin):
+        d = self.d = Path(self.tmp.name)
+        self.server, self.bin, self.outside = d / 'server', d / 'bin', d / 'outside'
+        for p in (self.server, self.bin, self.outside):
             p.mkdir()
-        for name, text in (('curl', FAKE_CURL), ('hf', FAKE_HF)):
-            (self.bin / name).write_text(text); (self.bin / name).chmod(0o755)
-        # the "interpreter archive": python/bin/python3 hands off to this test's own interpreter
+        (self.outside / 'victim').write_text('untouched\n')
+        (self.bin / 'curl').write_text(FAKE_CURL)
+        for name in ('hf', 'python3', 'python', 'pip', 'pip3', 'huggingface-cli'):
+            (self.bin / name).write_text(TRAP)
+        for f in self.bin.iterdir():
+            f.chmod(0o755)
+        # the "interpreter archive": python/bin/python3 hands off to this test's own interpreter by absolute path
         src = d / 'src' / 'python' / 'bin'; src.mkdir(parents=True)
         (src / 'python3').write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'); (src / 'python3').chmod(0o755)
         subprocess.run(['tar', '-czf', str(self.server / ARCHIVE), '-C', str(d / 'src'), 'python'], check=True)
         a = make_wheel(self.server, 'fixture-a', '1.0', requires=['fixture-b'])
         b = make_wheel(self.server, 'fixture-b', '2.0')
-        self.shas = tuple(hashlib.sha256(f.read_bytes()).hexdigest() for f in (self.server / ARCHIVE, a, b))
+        h = make_wheel(self.server, 'huggingface-hub', '1.0', module=HUB)
+        self.shas = tuple(hashlib.sha256(f.read_bytes()).hexdigest() for f in (self.server / ARCHIVE, a, b, h))
+        self.n = 0
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_step(self, L, title, **env):
-        code = next(s['code'] for s in sdk.steps({'model': 'test-model', 'launch': L}) if s['title'] == title)
-        return subprocess.run(['sh', '-c', code], cwd=self.work, capture_output=True, text=True,
-                              env={'PATH': f"{self.bin}:{os.environ['PATH']}", 'FAKE_SERVER': str(self.server), 'HOME': str(self.work), **env})
+    def work(self):
+        """A fresh working directory, with a planted python3 that must never run."""
+        self.n += 1
+        w = self.d / f'work{self.n}'
+        w.mkdir()
+        (w / 'python3').write_text(TRAP); (w / 'python3').chmod(0o755)
+        return w
 
-    def test_runtime_installs(self):
-        L = launch(runtime(self.shas))
-        r = self.run_step(L, 'Install the runtime')
+    def sh(self, code, work, shell=('sh', '-c'), **env):
+        return subprocess.run([*shell, code], cwd=work, capture_output=True, text=True,
+                              env={'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_SERVER': str(self.server), 'HOME': str(work),
+                                   'TRAPPED': str(work / 'TRAPPED'), **env})
+
+    def step(self, L, title, work, sdk_name='python', **env):
+        code = next(s['code'] for s in renderings(L)[sdk_name] if s['title'] == title)
+        return self.sh(code, work, **env)
+
+    def L(self, shas=None, root='rt'):
+        return launch(runtime(shas or self.shas, root=root), root=root)
+
+    def assertNothingRan(self, work):
+        self.assertFalse((work / 'TRAPPED').exists(), (work / 'TRAPPED').read_text() if (work / 'TRAPPED').exists() else '')
+
+    # 1. the whole command: success, and each failure stops every later stage with a non-zero exit, in either SDK
+
+    def test_whole_script_runs_on_the_pinned_runtime(self):
+        for name, script in renderings(self.L(), 'command').items():
+            for shell in SHELLS:
+                w = self.work()
+                r = self.sh(script, w, shell)
+                self.assertEqual(r.returncode, 0, (name, shell, r.stderr[-2000:]))
+                self.assertEqual((w / 'SERVER_STARTED').read_text(), 'ok')
+                self.assertEqual((w / 'rt/hf-cache/models--org--model/refs/main').read_text(), REV)
+                # 5. the weights came from the runtime's own huggingface_hub, not an hf on PATH
+                self.assertEqual(Path((w / 'HUB_USED').read_text()).resolve(), (w / 'rt/site/huggingface_hub/__init__.py').resolve())
+                # 4. nothing on PATH or planted in the working directory ran
+                self.assertNothingRan(w)
+                self.assertEqual(staging_left(w), [])
+
+    def test_whole_script_stops_at_each_failure(self):
+        bad = lambda i: tuple('0' * 64 if j == i else s for j, s in enumerate(self.shas))
+        cases = {  # name: (launch, env, set up, what must not exist afterwards)
+            'archive hash': (self.L(bad(0)), {}, None, ['rt/python', 'rt/site', 'rt/hf-cache', 'launcher', 'SERVER_STARTED']),
+            'wheel hash': (self.L(bad(2)), {}, None, ['rt/site', 'rt/wheels', 'rt/hf-cache', 'launcher', 'SERVER_STARTED']),
+            'missing snapshot': (self.L(), {'FAKE_HF_MISS': '1'}, None, ['rt/hf-cache/models--org--model/refs', 'launcher', 'SERVER_STARTED']),
+            'launcher': (self.L(), {}, lambda w: (w / 'launcher').write_text('a file in the way\n'), ['SERVER_STARTED']),
+        }
+        for case, (L, env, setup, absent) in cases.items():
+            for name, script in renderings(L, 'command').items():
+                for shell in SHELLS:
+                    w = self.work()
+                    if setup:
+                        setup(w)
+                    r = self.sh(script, w, shell, **env)
+                    self.assertNotEqual(r.returncode, 0, (case, name, shell))
+                    for a in absent:
+                        self.assertFalse((w / a).exists(), (case, name, shell, a))
+                    self.assertFalse((w / 'SERVER_STARTED').exists(), (case, name, shell))
+                    self.assertEqual(staging_left(w), [], (case, name, shell))
+
+    # 2. packages: a fresh staged target, published only after the whole install succeeded
+
+    def install(self, w, L=None):
+        L = L or self.L()
+        for title in ('Install the runtime', 'Install the packages'):
+            r = self.step(L, title, w)
+            self.assertEqual(r.returncode, 0, (title, r.stderr[-2000:]))
+
+    def test_reinstall_replaces_a_dirty_target_exactly(self):
+        ref = self.work(); self.install(ref)
+        w = self.work(); self.install(w)
+        (w / 'rt/site/fixture_a/__init__.py').write_text('TAMPERED = True\n')
+        (w / 'rt/site/stale_pkg').mkdir(); (w / 'rt/site/stale_pkg/__init__.py').write_text('')
+        (w / 'rt/wheels/stale-9-py3-none-any.whl').write_text('')
+        r = self.step(self.L(), 'Install the packages', w)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        self.assertEqual(tree(w / 'rt/site'), tree(ref / 'rt/site'))
+        self.assertEqual(tree(w / 'rt/wheels'), tree(ref / 'rt/wheels'))
+        self.assertEqual(staging_left(w), [])
+
+    def test_failed_reinstall_keeps_the_prior_target(self):
+        w = self.work(); self.install(w)
+        site, wheels = tree(w / 'rt/site'), tree(w / 'rt/wheels')
+        rt = runtime(self.shas); rt['packages']['wheels'] = [rt['packages']['wheels'][0], rt['packages']['wheels'][2]]  # fixture-b missing
+        for case, L in {'wrong wheel hash': self.L(self.shas[:2] + ('e' * 64,) + self.shas[3:]), 'incomplete lock': launch(rt)}.items():
+            r = self.step(L, 'Install the packages', w)
+            self.assertNotEqual(r.returncode, 0, case)
+            self.assertEqual(tree(w / 'rt/site'), site, case)
+            self.assertEqual(tree(w / 'rt/wheels'), wheels, case)
+            self.assertEqual(staging_left(w), [], case)
+
+    def test_reinstalled_runtime_replaces_only_the_archive_entries(self):
+        w = self.work(); self.install(w)
+        self.assertEqual(self.step(self.L(), 'Download the weights', w).returncode, 0)
+        (w / 'rt/python/STALE').write_text('')
+        site, cache = tree(w / 'rt/site'), tree(w / 'rt/hf-cache')
+        r = self.step(self.L(), 'Install the runtime', w)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue((self.work / 'rt/python/bin/python3').exists())
+        self.assertFalse((w / 'rt/python/STALE').exists())
+        self.assertEqual((tree(w / 'rt/site'), tree(w / 'rt/hf-cache')), (site, cache))
 
-    def test_wrong_archive_hash_stops_before_extracting(self):
-        L = launch(runtime(('f' * 64, *self.shas[1:])))
-        r = self.run_step(L, 'Install the runtime')
+    def test_wrong_archive_hash_leaves_the_prior_runtime(self):
+        w = self.work(); self.install(w)
+        before_ = tree(w / 'rt')
+        r = self.step(self.L(('f' * 64,) + self.shas[1:]), 'Install the runtime', w)
         self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((self.work / 'rt').exists())
-
-    @unittest.skipUnless(subprocess.run([sys.executable, '-I', '-m', 'pip', '--version'], capture_output=True).returncode == 0, 'needs pip')
-    def test_packages_install_offline(self):
-        L = launch(runtime(self.shas))
-        self.assertEqual(self.run_step(L, 'Install the runtime').returncode, 0)
-        r = self.run_step(L, 'Install the packages', PIP_CONFIG_FILE=os.devnull)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        for m in ('fixture_a', 'fixture_b'):
-            self.assertTrue((self.work / 'rt/site' / m / '__init__.py').exists(), m)
-        self.assertEqual((self.work / 'rt/wheels/requirements.lock.txt').read_text().splitlines(),
-                         [f'fixture-a==1.0 --hash=sha256:{self.shas[1]}', f'fixture-b==2.0 --hash=sha256:{self.shas[2]}'])
-
-    @unittest.skipUnless(subprocess.run([sys.executable, '-I', '-m', 'pip', '--version'], capture_output=True).returncode == 0, 'needs pip')
-    def test_incomplete_bundle_fails(self):
-        # fixture-a needs fixture-b; a lock without it cannot install offline
-        rt = runtime(self.shas)
-        rt['packages']['wheels'] = rt['packages']['wheels'][:1]
-        L = launch(rt)
-        self.assertEqual(self.run_step(L, 'Install the runtime').returncode, 0)
-        r = self.run_step(L, 'Install the packages', PIP_CONFIG_FILE=os.devnull)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((self.work / 'rt/site/fixture_a').exists())
-
-    def test_wrong_wheel_hash_stops_before_pip(self):
-        L = launch(runtime((self.shas[0], self.shas[1], 'e' * 64)))
-        r = self.run_step(L, 'Install the packages')
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('FAILED', r.stdout + r.stderr)
-        self.assertFalse((self.work / 'rt/wheels/requirements.lock.txt').exists())
-        self.assertFalse((self.work / 'rt/site').exists())
+        self.assertEqual(tree(w / 'rt'), before_)
 
     def test_missing_wheel_stops(self):
+        w = self.work(); self.step(self.L(), 'Install the runtime', w)
         (self.server / 'fixture_b-2.0-py3-none-any.whl').unlink()
-        r = self.run_step(launch(runtime(self.shas)), 'Install the packages')
+        r = self.step(self.L(), 'Install the packages', w)
         self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((self.work / 'rt/wheels/SHA256SUMS').exists())
+        self.assertFalse((w / 'rt/site').exists() or (w / 'rt/wheels').exists())
 
-    def test_hub_cache_gets_its_ref(self):
-        r = self.run_step(launch(), 'Download the weights')
+    # 3. no write through a symlink, at the destination or any directory above it, in either SDK's rendering
+
+    def test_symlinks_are_refused(self):
+        def link(rel, to=None):
+            def make(w):
+                (w / rel).parent.mkdir(parents=True, exist_ok=True)
+                if (w / rel).is_dir() and not (w / rel).is_symlink():
+                    shutil.rmtree(w / rel)
+                elif (w / rel).exists():
+                    (w / rel).unlink()
+                (w / rel).symlink_to(to or self.outside)
+            return make
+        m = 'rt/hf-cache/models--org--model'
+        cases = {  # name: (launch, prerequisite steps, symlink, step)
+            'into leaf': (self.L(), [], link('rt'), 'Install the runtime'),
+            'archive entry': (self.L(), [], link('rt/python'), 'Install the runtime'),
+            'into parent': (self.L(root='opt/rt'), [], link('opt'), 'Install the runtime'),
+            'wheel dir leaf': (self.L(), ['Install the runtime'], link('rt/wheels'), 'Install the packages'),
+            'target leaf': (self.L(), ['Install the runtime'], link('rt/site'), 'Install the packages'),
+            'packages parent': (self.L(root='opt/rt'), [], link('opt'), 'Install the packages'),
+            'cache leaf': (self.L(), ['Install the runtime', 'Install the packages'], link('rt/hf-cache'), 'Download the weights'),
+            'model dir': (self.L(), ['Install the runtime', 'Install the packages'], link(m), 'Download the weights'),
+            'refs dir': (self.L(), ['Install the runtime', 'Install the packages'], link(m + '/refs'), 'Download the weights'),
+            'ref leaf': (self.L(), ['Install the runtime', 'Install the packages'], link(m + '/refs/main', self.outside / 'victim'), 'Download the weights'),
+            'cache parent': (self.L(root='opt/rt'), [], link('opt'), 'Download the weights'),
+            'launcher leaf': (self.L(), [], link('launcher/serve.py', self.outside / 'victim'), 'Write the launcher'),
+            'launcher parent': (self.L(), [], link('launcher'), 'Write the launcher'),
+        }
+        for case, (L, pre, make, title) in cases.items():
+            for name in renderings(L):
+                w = self.work()
+                for p in pre:
+                    self.assertEqual(self.step(L, p, w, name).returncode, 0, (case, p))
+                make(w)
+                was = tree(self.outside)
+                r = self.step(L, title, w, name)
+                self.assertNotEqual(r.returncode, 0, (case, name))
+                self.assertIn('is a symlink', r.stderr, (case, name))
+                self.assertEqual(tree(self.outside), was, (case, name))
+
+    # 5. the weights step needs nothing on PATH
+
+    def test_weights_without_any_hf_on_path(self):
+        w = self.work(); self.install(w)
+        r = self.step(self.L(), 'Download the weights', w, PATH='/usr/bin:/bin')
         self.assertEqual(r.returncode, 0, r.stderr)
-        ref = self.work / 'rt/hf-cache/models--org--model/refs/main'
-        self.assertEqual(ref.read_text(), REV)
-        self.assertTrue((self.work / f'rt/hf-cache/models--org--model/snapshots/{REV}/config.json').exists())
+        self.assertEqual((w / 'rt/hf-cache/models--org--model/refs/main').read_text(), REV)
 
     def test_missing_snapshot_writes_no_ref(self):
-        r = self.run_step(launch(), 'Download the weights', FAKE_HF_MISS='1')
+        w = self.work(); self.install(w)
+        r = self.step(self.L(), 'Download the weights', w, FAKE_HF_MISS='1')
         self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((self.work / 'rt/hf-cache/models--org--model/refs').exists())
+        self.assertFalse((w / 'rt/hf-cache/models--org--model/refs').exists())
 
 
 if __name__ == '__main__':

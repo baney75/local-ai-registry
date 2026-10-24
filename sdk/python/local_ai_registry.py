@@ -106,7 +106,9 @@ def _url_file(url):
 
 def _check_host(l):
     """Refuse to render a host runtime or hub weights that lab.py check would reject."""
-    for w in _weights(l):
+    ws = _weights(l)
+    _ok(len({w.get("layout") == "hub" for w in ws}) <= 1, "hub and directory weights mixed in one launch")
+    for w in ws:
         if "ref" in w:
             _ok(w.get("layout") == "hub" and _is(_RT_REF, w["ref"]), f"weights.ref {w.get('ref')!r}")
         if w.get("layout") == "hub":
@@ -123,11 +125,13 @@ def _check_host(l):
         _ok(_is(_RT_URL, a["url"]) and _is(_RT_ARCHIVE, _url_file(a["url"])), f"runtime.archive.url {a.get('url')!r}")
         _ok(_is(_RT_SHA, a["sha256"]) and _is(_RT_REL, a["into"]), "runtime.archive sha256 or into")
     if "python" in rt:
-        _ok(_is(_RT_REL, rt["python"]), f"runtime.python {rt.get('python')!r}")
+        _ok(_is(_RT_REL, rt["python"]) and "archive" in rt and rt["python"].startswith(rt["archive"]["into"] + "/"),
+            f"runtime.python {rt.get('python')!r} is not inside runtime.archive.into")
     if "packages" in rt:
         pk = rt["packages"]
         _ok("python" in rt and isinstance(pk, dict) and set(pk) == {"dir", "target", "wheels"}, "runtime.packages keys")
         _ok(_is(_RT_REL, pk["dir"]) and _is(_RT_REL, pk["target"]), "runtime.packages dir or target")
+        _ok(not _nested(pk["dir"], pk["target"]), "runtime.packages dir and target overlap")
         _ok(isinstance(pk["wheels"], list) and pk["wheels"], "runtime.packages.wheels")
         seen = set()
         for w in pk["wheels"]:
@@ -138,6 +142,15 @@ def _check_host(l):
             _ok(_is(_RT_WHEEL, f) and _canon(dist) == _canon(w["name"]) and ver == w["version"], f"wheel file {f!r}")
             _ok(_canon(w["name"]) not in seen, f"wheel {w['name']} listed twice")
             seen.add(_canon(w["name"]))
+    if ws:
+        _ok("packages" in rt and "huggingface-hub" in {_canon(w["name"]) for w in rt["packages"]["wheels"]} and ws[0].get("layout") == "hub",
+            "weights with a runtime need hub layout and a pinned huggingface_hub wheel")
+    if l.get("config"):
+        _ok(_is(_RT_REL, l["config"].get("at")), "launcher path")
+
+
+def _nested(a, b):
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def _weights(l):
@@ -145,42 +158,95 @@ def _weights(l):
     return [w for w in (ws if isinstance(ws, list) else [ws]) if w and w.get("repo")]
 
 
+_NOLINK = ('nolink() { for p; do if [ -L "$p" ]; then echo "local-ai: $p is a symlink; refusing to write through it" >&2; exit 1; fi; done; }')
+_HUB = ("import sys; sys.path.insert(0, sys.argv[1]); from huggingface_hub import snapshot_download; "
+        "snapshot_download(sys.argv[2], revision=sys.argv[3], cache_dir=sys.argv[4], allow_patterns=sys.argv[5:] or None)")
+
+
+def _prefixes(path):
+    """`a/b/c` -> `a a/b a/b/c`: every directory a write to `path` passes through, quoted."""
+    parts = path.split("/")
+    return " ".join(_q("/".join(parts[:i + 1])) for i in range(len(parts)))
+
+
+def _parent(path):
+    return path.rsplit("/", 1)[0] if "/" in path else "."
+
+
+def _strict(lines):
+    """One step as one subshell that stops at its first failure and returns non-zero (pasted alone or in a script)."""
+    return "(\nset -e\n" + "\n".join(lines) + "\n)"
+
+
 def _runtime_steps(rt):
-    """The pinned interpreter archive, then the hash-locked offline wheel install: each step stops at its first failure."""
+    """The pinned interpreter archive, then the hash-locked offline wheel install. Each is staged in a fresh directory
+    beside its destination, checked, and only then published by rename, never through a symlink."""
     out = []
     if "archive" in rt:
-        a = rt["archive"]
-        f = _url_file(a["url"])
-        out.append({"title": "Install the runtime", "code": " && \\\n".join([
-            f"curl -fL -o {_q(f)} {_q(a['url'])}",
-            f"echo '{a['sha256']}  {f}' | shasum -a 256 -c -",
-            f"mkdir -p {_q(a['into'])}",
-            f"tar -xzf {_q(f)} -C {_q(a['into'])}"])})
+        a, into = rt["archive"], rt["archive"]["into"]
+        f, d = _url_file(a["url"]), _q(into)
+        out.append({"title": "Install the runtime", "code": _strict([
+            _NOLINK,
+            f"nolink {_prefixes(into)}",
+            f"mkdir -p {d}",
+            f"s=$(mktemp -d {d}/.local-ai-runtime.XXXXXX)",
+            "trap 'rm -rf \"$s\"' EXIT",
+            f'curl -fL -o "$s"/{_q(f)} {_q(a["url"])}',
+            f"(cd \"$s\" && echo '{a['sha256']}  {f}' | shasum -a 256 -c -)",
+            'mkdir "$s/x"',
+            f'tar -xzf "$s"/{_q(f)} -C "$s/x"',
+            'test -n "$(ls -A "$s/x")"',
+            'for n in $(ls -A "$s/x"); do',
+            '  case $n in .local-ai-*|*[!A-Za-z0-9._+-]*) echo "local-ai: unexpected archive entry $n" >&2; exit 1;; esac',
+            f'  nolink {d}/"$n"',
+            f'  if [ -e {d}/"$n" ]; then mv {d}/"$n" "$s/old-$n"; fi',
+            f'  mv "$s/x/$n" {d}/"$n"',
+            "done",
+            *([f"test -x {_q('./' + rt['python'])}"] if rt.get("python") else [])])})
     if "packages" in rt:
-        pk, d = rt["packages"], rt["packages"]["dir"]
+        pk = rt["packages"]
+        d, t = pk["dir"], pk["target"]
         files = [_url_file(w["url"]) for w in pk["wheels"]]
-        out.append({"title": "Install the packages", "code": " && \\\n".join([
-            f"mkdir -p {_q(d)}",
-            *[f"curl -fL -o {_q(d + '/' + f)} {_q(w['url'])}" for w, f in zip(pk["wheels"], files)],
-            "printf '%s\\n' " + " ".join(_q(f"{w['sha256']}  {f}") for w, f in zip(pk["wheels"], files)) + f" > {_q(d + '/SHA256SUMS')}",
-            f"(cd {_q(d)} && shasum -a 256 -c SHA256SUMS)",
-            "printf '%s\\n' " + " ".join(_q(f"{w['name']}=={w['version']} --hash=sha256:{w['sha256']}") for w in pk["wheels"]) + f" > {_q(d + '/requirements.lock.txt')}",
-            f"{_q(rt['python'])} -I -m pip install --no-index --find-links {_q(d)} --only-binary :all: --require-hashes "
-            f"-r {_q(d + '/requirements.lock.txt')} --target {_q(pk['target'])} --no-compile --disable-pip-version-check"])})
+        out.append({"title": "Install the packages", "code": _strict([
+            _NOLINK,
+            f"nolink {_prefixes(d)} {_prefixes(t)}",
+            f"mkdir -p {_q(_parent(d))} {_q(_parent(t))}",
+            f"w=$(mktemp -d {_q(_parent(d))}/.local-ai-wheels.XXXXXX)",
+            f"s=$(mktemp -d {_q(_parent(t))}/.local-ai-packages.XXXXXX)",
+            "trap 'rm -rf \"$w\" \"$w.old\" \"$s\"' EXIT",
+            *[f'curl -fL -o "$w"/{_q(f)} {_q(w["url"])}' for w, f in zip(pk["wheels"], files)],
+            "printf '%s\\n' " + " ".join(_q(f"{w['sha256']}  {f}") for w, f in zip(pk["wheels"], files)) + ' > "$w/SHA256SUMS"',
+            '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
+            "printf '%s\\n' " + " ".join(_q(f"{w['name']}=={w['version']} --hash=sha256:{w['sha256']}") for w in pk["wheels"]) + ' > "$w/requirements.lock.txt"',
+            f"{_q('./' + rt['python'])} -I -m pip --isolated install --no-index --find-links \"$w\" --only-binary :all: --require-hashes "
+            '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --disable-pip-version-check',
+            f'if [ -e {_q(t)} ]; then mv {_q(t)} "$s/old"; fi',
+            f'mv "$s/t" {_q(t)}',
+            f'if [ -e {_q(d)} ]; then mv {_q(d)} "$w.old"; fi',
+            f'mv "$w" {_q(d)}'])})
     return out
 
 
-def _host_download(w):
+def _host_download(w, rt=None):
     """Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub) whose pinned snapshot must exist and,
-    with `ref`, whose task-local refs/<ref> then names that revision."""
+    with `ref`, whose task-local refs/<ref> then names that revision. With a pinned runtime the download runs on its own
+    interpreter and huggingface_hub, never an `hf` from PATH."""
     if w.get("layout") != "hub":
         return f"hf download {w['repo']}{_files(w)} \\\n  --revision {w['revision']} \\\n  --local-dir {w['at']}"
-    d = f"{w['at']}/models--{w['repo'].replace('/', '--')}"
-    parts = [f"hf download {w['repo']}{_files(w)} \\\n  --revision {w['revision']} \\\n  --cache-dir {_q(w['at'])}",
-             f"test -d {_q(d + '/snapshots/' + w['revision'])}"]
+    at, rev = w["at"], w["revision"]
+    m = f"{at}/models--{w['repo'].replace('/', '--')}"
+    owned = " ".join(_q(p) for p in [m, m + "/snapshots", f"{m}/snapshots/{rev}", m + "/refs", *([f"{m}/refs/{w['ref']}"] if w.get("ref") else [])])
+    fs = w.get("files") or []
+    fs = fs if isinstance(fs, list) else [fs]
+    if rt:
+        get = f"{_q('./' + rt['python'])} -I -c {_q(_HUB)} {_q(rt['packages']['target'])} {w['repo']} {rev} {_q(at)}" + "".join(f" {_q(f)}" for f in fs)
+    else:
+        get = f"hf download {w['repo']}{_files(w)} --revision {rev} --cache-dir {_q(at)}"
+    lines = [f"nolink {_prefixes(at)} {owned}", f"mkdir -p {_q(at)}", get, f"nolink {owned}", f"test -d {_q(f'{m}/snapshots/{rev}')}"]
     if w.get("ref"):
-        parts += [f"mkdir -p {_q(d + '/refs')}", f"printf '%s' {w['revision']} > {_q(d + '/refs/' + w['ref'])}"]
-    return " && \\\n".join(parts)
+        lines += [f"mkdir -p {_q(m + '/refs')}", f"printf '%s' {rev} > {_q(m + '/refs/.local-ai-' + w['ref'])}",
+                  f"mv {_q(m + '/refs/.local-ai-' + w['ref'])} {_q(m + '/refs/' + w['ref'])}"]
+    return lines
 
 
 def _host_steps(l):
@@ -189,8 +255,9 @@ def _host_steps(l):
     installs that runtime first (in place of the free-text `install`)."""
     _check_host(l)
     env = [f"{k}={_value(v)}" for k, v in (l.get("env") or {}).items()]
-    if l.get("runtime"):
-        out = _runtime_steps(l["runtime"])
+    rt = l.get("runtime")
+    if rt:
+        out = _runtime_steps(rt)
     else:
         if not l.get("pip") and not l.get("weights"):
             return [{"title": "Install", "code": _install(l["install"])}, {"title": "Start the server", "code": " ".join(env + [_q(c) for c in l["command"]])}]
@@ -198,11 +265,18 @@ def _host_steps(l):
         if l.get("pip") and re.fullmatch(r"https://\S+\.tar\.gz#sha256=[0-9a-f]{64}", l.get("install") or ""):
             out.append({"title": "Install the native engine", "code": _install(l["install"])})
     if l.get("weights"):
-        out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
+        if any(w.get("layout") == "hub" for w in l["weights"]):  # a cache: checked, confined and stopped at its first failure
+            out.append({"title": "Download the weights", "code": _strict([_NOLINK, *[x for w in l["weights"] for x in _host_download(w, rt)]])})
+        else:
+            out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
     if l.get("config"):
         at = l["config"]["at"]
-        mk = f"mkdir -p {at.rsplit('/', 1)[0]}\n" if "/" in at else ""
-        out.append({"title": "Write the launcher", "code": f"{mk}cat > {at} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"})
+        if rt:
+            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
+                                                                         f"cat > {_q(at)} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])})
+        else:
+            mk = f"mkdir -p {at.rsplit('/', 1)[0]}\n" if "/" in at else ""
+            out.append({"title": "Write the launcher", "code": f"{mk}cat > {at} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"})
     if l.get("sysctl"):
         out.append({"title": "Raise the GPU memory limit (resets on reboot)",
                     "code": "\n".join(f"sudo sysctl {k}={v}" for k, v in l["sysctl"].items())})
@@ -291,8 +365,11 @@ def _install(url):
 
 
 def command(r):
-    """All the steps as one shell script."""
-    return "\n\n".join(f"# {s['title']}\n{s['code']}" for s in steps(r))
+    """All the steps as one shell script. One with a pinned runtime or a host Hugging Face cache stops at the first step
+    that fails, however it is run."""
+    l = r["launch"]
+    strict = l.get("kind") == "host" and (l.get("runtime") or any(w.get("layout") == "hub" for w in _weights(l)))
+    return ("set -e\n\n" if strict else "") + "\n\n".join(f"# {s['title']}\n{s['code']}" for s in steps(r))
 
 
 if __name__ == "__main__":

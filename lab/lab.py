@@ -662,6 +662,8 @@ def check_host_runtime(launch):
     kind = launch.get("kind")
     weights = launch.get("weights") or []
     weights = weights if isinstance(weights, list) else [weights]
+    if kind == "host":
+        assert len({w.get("layout") == "hub" for w in weights}) <= 1, "host weights mix hub and directory layouts"
     for w in weights:
         if "ref" in w:
             assert kind == "host" and w.get("layout") == "hub", "weights.ref is only for host weights with layout hub"
@@ -686,14 +688,17 @@ def check_host_runtime(launch):
         assert re.fullmatch(RT_ARCHIVE, _url_file(a["url"])), f"runtime.archive file {_url_file(a['url'])!r} is not a .tar.gz/.tgz"
         assert isinstance(a["sha256"], str) and re.fullmatch(RT_SHA, a["sha256"]), "runtime.archive.sha256"
         assert isinstance(a["into"], str) and re.fullmatch(RT_REL, a["into"]), f"runtime.archive.into {a.get('into')!r}"
-    if "python" in rt:
+    if "python" in rt:  # inside the pinned archive, so never a name looked up on PATH
         assert isinstance(rt["python"], str) and re.fullmatch(RT_REL, rt["python"]), f"runtime.python {rt.get('python')!r}"
+        assert "archive" in rt and rt["python"].startswith(rt["archive"]["into"] + "/"), "runtime.python must be inside runtime.archive.into"
     if "packages" in rt:
         pk = rt["packages"]
         assert "python" in rt, "runtime.packages needs runtime.python"
         assert isinstance(pk, dict) and set(pk) == {"dir", "target", "wheels"}, "runtime.packages needs exactly dir, target, wheels"
         for k in ("dir", "target"):
             assert isinstance(pk[k], str) and re.fullmatch(RT_REL, pk[k]), f"runtime.packages.{k} {pk.get(k)!r}"
+        d, t = pk["dir"], pk["target"]
+        assert not (d == t or d.startswith(t + "/") or t.startswith(d + "/")), "runtime.packages dir and target overlap"
         assert isinstance(pk["wheels"], list) and pk["wheels"], "runtime.packages.wheels is a non-empty list"
         names, files = set(), set()
         for w in pk["wheels"]:
@@ -708,6 +713,12 @@ def check_host_runtime(launch):
             assert _canon(dist) == _canon(w["name"]) and ver == w["version"], f"wheel file {f} is not {w['name']} {w['version']}"
             assert _canon(w["name"]) not in names and f not in files, f"wheel {w['name']} listed twice"
             names.add(_canon(w["name"])); files.add(f)
+    if weights:  # downloaded by the runtime's own huggingface_hub into a cache, never by an hf on PATH
+        assert all(w.get("layout") == "hub" for w in weights), "weights with a runtime need layout hub"
+        assert "packages" in rt and "huggingface-hub" in {_canon(w["name"]) for w in rt["packages"]["wheels"]}, \
+            "weights with a runtime need a pinned huggingface_hub wheel in runtime.packages"
+    if launch.get("config"):
+        assert isinstance(launch["config"].get("at"), str) and re.fullmatch(RT_REL, launch["config"]["at"]), "launcher path"
 
 
 def check_needs(n):
