@@ -49,14 +49,101 @@ const pairs = (a) => {
   return args;
 };
 
+// A pinned host runtime and Hugging Face cache weights: the same rules as lab/lab.py check_host_runtime and the Python SDK,
+// checked again here so that nothing malformed is ever rendered into a shell command (fail closed).
+const RT = {
+  sha: /^[0-9a-f]{64}$/, rev: /^[0-9a-f]{40}$/,
+  rel: /^(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9_][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._+-]*)*$/,
+  url: /^https:\/\/[A-Za-z0-9.-]+(?:\/[A-Za-z0-9._~%+-]+)+$/,
+  archive: /^[A-Za-z0-9][A-Za-z0-9._+-]*\.(?:tar\.gz|tgz)$/, wheel: /^[A-Za-z0-9][A-Za-z0-9._+-]*\.whl$/,
+  name: /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/, version: /^[A-Za-z0-9][A-Za-z0-9.+!_-]*$/,
+  ref: /^[A-Za-z0-9][A-Za-z0-9._-]*$/, repo: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/,
+};
+const ok = (cond, msg) => { if (!cond) throw new Error(`invalid host runtime: ${msg}`); };
+const is = (re, v) => typeof v === "string" && re.test(v);
+const keys = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o).sort().join(",") : null);
+const canon = (n) => n.replace(/[-_.]+/g, "-").toLowerCase();
+const urlFile = (u) => decodeURIComponent(u.slice(u.lastIndexOf("/") + 1));
+function checkHost(l) {
+  for (const w of weights(l)) {
+    if ("ref" in w) ok(w.layout === "hub" && is(RT.ref, w.ref), `weights.ref ${w.ref}`);
+    if (w.layout === "hub") {
+      ok(is(RT.repo, w.repo) && is(RT.rev, w.revision) && is(RT.rel, w.at), "hub weights repo, revision or cache dir");
+      ok((Array.isArray(w.files) ? w.files : w.files ? [w.files] : []).every((f) => is(RT.rel, f)), "hub weights files");
+    }
+  }
+  const rt = l.runtime;
+  if (rt === undefined || rt === null) return;
+  ok(keys(rt) && Object.keys(rt).length && Object.keys(rt).every((k) => ["archive", "python", "packages"].includes(k)) && !l.pip?.length, "runtime keys");
+  if ("archive" in rt) {
+    const a = rt.archive;
+    ok(keys(a) === "into,sha256,url", "runtime.archive keys");
+    ok(is(RT.url, a.url) && is(RT.archive, urlFile(a.url)), `runtime.archive.url ${a.url}`);
+    ok(is(RT.sha, a.sha256) && is(RT.rel, a.into), "runtime.archive sha256 or into");
+  }
+  if ("python" in rt) ok(is(RT.rel, rt.python), `runtime.python ${rt.python}`);
+  if ("packages" in rt) {
+    const pk = rt.packages;
+    ok("python" in rt && keys(pk) === "dir,target,wheels", "runtime.packages keys");
+    ok(is(RT.rel, pk.dir) && is(RT.rel, pk.target), "runtime.packages dir or target");
+    ok(Array.isArray(pk.wheels) && pk.wheels.length, "runtime.packages.wheels");
+    const seen = new Set();
+    for (const w of pk.wheels) {
+      ok(keys(w) === "name,sha256,url,version", "wheel keys");
+      ok(is(RT.name, w.name) && is(RT.version, w.version) && is(RT.url, w.url) && is(RT.sha, w.sha256), `wheel ${w.name}`);
+      const f = urlFile(w.url), [dist = "", ver = ""] = f.split("-");
+      ok(is(RT.wheel, f) && canon(dist) === canon(w.name) && ver === w.version, `wheel file ${f}`);
+      ok(!seen.has(canon(w.name)), `wheel ${w.name} listed twice`);
+      seen.add(canon(w.name));
+    }
+  }
+}
+
+/** The pinned interpreter archive, then the hash-locked offline wheel install: each step stops at its first failure. */
+function runtimeSteps(rt) {
+  const out = [];
+  if (rt.archive) {
+    const a = rt.archive, f = urlFile(a.url);
+    out.push({ title: "Install the runtime", code: [`curl -fL -o ${q(f)} ${q(a.url)}`, `echo '${a.sha256}  ${f}' | shasum -a 256 -c -`,
+      `mkdir -p ${q(a.into)}`, `tar -xzf ${q(f)} -C ${q(a.into)}`].join(" && \\\n") });
+  }
+  if (rt.packages) {
+    const pk = rt.packages, d = pk.dir, fs = pk.wheels.map((w) => urlFile(w.url));
+    out.push({ title: "Install the packages", code: [`mkdir -p ${q(d)}`,
+      ...pk.wheels.map((w, i) => `curl -fL -o ${q(`${d}/${fs[i]}`)} ${q(w.url)}`),
+      `printf '%s\\n' ${pk.wheels.map((w, i) => q(`${w.sha256}  ${fs[i]}`)).join(" ")} > ${q(`${d}/SHA256SUMS`)}`,
+      `(cd ${q(d)} && shasum -a 256 -c SHA256SUMS)`,
+      `printf '%s\\n' ${pk.wheels.map((w) => q(`${w.name}==${w.version} --hash=sha256:${w.sha256}`)).join(" ")} > ${q(`${d}/requirements.lock.txt`)}`,
+      `${q(rt.python)} -I -m pip install --no-index --find-links ${q(d)} --only-binary :all: --require-hashes ` +
+      `-r ${q(`${d}/requirements.lock.txt`)} --target ${q(pk.target)} --no-compile --disable-pip-version-check`].join(" && \\\n") });
+  }
+  return out;
+}
+
+/** Host weights: a directory (--local-dir), or a Hugging Face cache (layout hub) whose pinned snapshot must exist and,
+ *  with `ref`, whose task-local refs/<ref> then names that revision. */
+function hostDownload(w) {
+  if (w.layout !== "hub") return `hf download ${w.repo}${files(w)} \\\n  --revision ${w.revision} \\\n  --local-dir ${w.at}`;
+  const d = `${w.at}/models--${w.repo.replace("/", "--")}`;
+  const parts = [`hf download ${w.repo}${files(w)} \\\n  --revision ${w.revision} \\\n  --cache-dir ${q(w.at)}`, `test -d ${q(`${d}/snapshots/${w.revision}`)}`];
+  if (w.ref) parts.push(`mkdir -p ${q(`${d}/refs`)}`, `printf '%s' ${w.revision} > ${q(`${d}/refs/${w.ref}`)}`);
+  return parts.join(" && \\\n");
+}
+
 /** A program on the host. One with pinned packages or weights (MLX, oMLX or llama.cpp on Apple silicon) also downloads
- *  its weights, writes its launcher and raises the GPU wired-memory limit before it starts. */
+ *  its weights, writes its launcher and raises the GPU wired-memory limit before it starts. One with a pinned `runtime`
+ *  installs that runtime first (in place of the free-text `install`). */
 function hostSteps(l) {
+  checkHost(l);
   const env = Object.entries(l.env ?? {}).map(([k, v]) => `${k}=${value(v)}`);
-  if (!l.pip && !l.weights?.length) return [{ title: "Install", code: install(l.install) }, { title: "Start the server", code: [...env, ...l.command.map(q)].join(" ") }];
-  const out = [l.pip ? { title: "Install the engine", code: `python3 -m pip install ${l.pip.map(q).join(" ")}` } : { title: "Install the engine", code: install(l.install) }];
-  if (l.pip && /^https:\/\/\S+\.tar\.gz#sha256=[0-9a-f]{64}$/.test(l.install ?? "")) out.push({ title: "Install the native engine", code: install(l.install) });
-  if (l.weights?.length) out.push({ title: "Download the weights", code: l.weights.map((w) => `hf download ${w.repo}${files(w)} \\\n  --revision ${w.revision} \\\n  --local-dir ${w.at}`).join("\n\n") });
+  let out;
+  if (l.runtime) out = runtimeSteps(l.runtime);
+  else {
+    if (!l.pip && !l.weights?.length) return [{ title: "Install", code: install(l.install) }, { title: "Start the server", code: [...env, ...l.command.map(q)].join(" ") }];
+    out = [l.pip ? { title: "Install the engine", code: `python3 -m pip install ${l.pip.map(q).join(" ")}` } : { title: "Install the engine", code: install(l.install) }];
+    if (l.pip && /^https:\/\/\S+\.tar\.gz#sha256=[0-9a-f]{64}$/.test(l.install ?? "")) out.push({ title: "Install the native engine", code: install(l.install) });
+  }
+  if (l.weights?.length) out.push({ title: "Download the weights", code: l.weights.map(hostDownload).join("\n\n") });
   if (l.config) out.push({ title: "Write the launcher", code: `${l.config.at.includes("/") ? `mkdir -p ${l.config.at.replace(/\/[^/]*$/, "")}\n` : ""}cat > ${l.config.at} <<'EOF'\n${l.config.text.trimEnd()}\nEOF` });
   if (l.sysctl) out.push({ title: "Raise the GPU memory limit (resets on reboot)", code: Object.entries(l.sysctl).map(([k, v]) => `sudo sysctl ${k}=${v}`).join("\n") });
   const run = [...env, l.command[0], ...pairs(l.command.slice(1))];
