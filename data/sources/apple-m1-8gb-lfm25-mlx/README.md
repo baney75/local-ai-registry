@@ -1,6 +1,7 @@
 # Apple M1 8 GB: LFM2.5-2.6B on MLX (mlx-lm 0.31.3, uncapped), a 32K window and a 24,576-token prompt limit, on the SDK's pinned host runtime
 
-**Depends on #361** (the pinned host runtime; head `40bb285b`, which is SDK `7641917e` plus the 2026-10-25 catalog date refresh).
+**Depends on #361** (the pinned host runtime; head `ff00ce61`, which is SDK `7641917e`, the 2026-10-25 catalog date refresh `40bb285b`
+and a test-only correction to `lab/test_host_topology.py` for launches that pin a runtime).
 This launch uses #361's `runtime` field and hub-layout weights with `ref`, and every setup step below is the SDK's own rendering of it.
 This commit adds one optional field to that contract, `runtime.macos` (below).
 
@@ -174,7 +175,7 @@ Then run `bash tools/macmini-run3.sh setup|start|lab|probe|stop TAG`, and for th
 
 This run's task directory was built that way from `git archive` of the interim commit `91d36083` and checked against its manifest
 (10,494 files) on the target. Against this commit, file by file:
-- **byte-identical (10,471 files)**, among them everything that ran or rendered the run: `lab/lab.py`, `sdk/js/index.js`,
+- **byte-identical (10,470 files)**, among them everything that ran or rendered the run: `lab/lab.py`, `sdk/js/index.js`,
   `sdk/python/local_ai_registry.py`, the launch and launcher in `registry/launches/`, the patch, the regression harness
   (`runtime/test_unlimited_max_tokens.py`, `run_regression_cpu.py`), and the tools `observer.py`, `memwatch_native.py`,
   `probe_m1.py`, `seedprobe.py`, `pristine_sampler.py` and `check_run.py`;
@@ -198,7 +199,8 @@ This run's task directory was built that way from `git archive` of the interim c
   `EXIT` or `ABORT` line saying `clean=True`, none hit a supervision or logging error, none shared a state directory with another (one
   `gw-*` directory per phase and run), and every memory poll of theirs had both readings, so the fixed version gives every one of them the
   exit code the run recorded. Their logs, and
-  `tools/groupwatch-options-test.txt`, predate the token prefix on log lines. `sdk/js/index.d.ts` gained the types `Proof.note` and `Proof.tps_estimated` (declarations only; nothing rendered changes).
+  `tools/groupwatch-options-test.txt`, predate the token prefix on log lines. `lab/test_host_topology.py` is #361's corrected test at `ff00ce61` (a unit test the
+  run never used; this launch's pin, `fcfc3a6d`, is the same). `sdk/js/index.d.ts` gained the types `Proof.note` and `Proof.tps_estimated` (declarations only; nothing rendered changes).
 
 The kit's Qwen-specific reference panel and its generic sweep were not run, and no kit result is claimed.
 
