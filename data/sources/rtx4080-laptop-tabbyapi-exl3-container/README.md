@@ -64,4 +64,31 @@ It exits 0 only if the six gates, the repeat and every postcondition pass, the s
 
 [test_repro.py](test_repro.py) runs `repro.sh` on CPU against a stub Podman and `nvidia-smi` and a fake TabbyAPI, with the real stock lab. It checks that a correct run exits 0, and that a run fails when an answer has the right text but ends with `length` (reasoning, tool call, context, speed or repeat). The stock lab passes that last case on its own. It also checks failure on a log that fails or is empty, a container that cannot be removed, a container with another run's label (left untouched), a busy or different GPU, a missing driver library, mismatched weights, a held lock, and a server that never becomes healthy, hangs, or fails to start. A container `rm` that fails once must be escalated and still end clean. The idle cases cover a GPU at 99 % with no compute process, a GPU that becomes busy after the pull, malformed, two-line, failed and timed-out queries, running on battery, and parish-media reporting not ready or failing. None of them starts a container. In the worst-case fixture the overall bound expires during the lab while the log, removal, kill and absence calls all hang past TERM and the GPU readback hangs. Cleanup still reaches its verdict after 165 s of the 540 s reserve, and the run ends by TERM, not KILL. A copy with a 60 s reserve fails that fixture. Two more fixtures land the deadline inside the server-log save, one after a passing run and one after a failing run. In both, the log is saved (and stays free of controller output), the container is removed and confirmed gone, the helper is gone, and cleanup reaches its verdict. The earlier TERM handler, which exited in the middle of cleanup, fails both. Four more fixtures send TERM, INT, or TERM then INT from inside the final verdict stamp, and once after a failing run. The process must exit 143, 130, 143 or keep the failure's own 8. A handler that only records the signal fails all four.
 
-The measured run above came from the task runner that `repro.sh` was built from: the same recorder, checks, mapping and launch. `repro.sh` itself has passed only its CPU fixtures so far.
+The first measured run above came from the task runner that `repro.sh` was built from: the same recorder, checks, mapping and launch. `repro.sh` itself then ran once on the same card, as recorded below.
+
+## Confirmation run of repro.sh on the card
+
+On 2026-10-25 UTC the published command ran once, unchanged, from a clean export of the committed tree: `repro.sh` SHA256 1cdb92c43c6ffc0e262a85b4b6122688cb90caec0e634c8569ff254193939224, with the same weights, image, launch and lab pins as above. parish-media reported the GPU ready immediately before the run. `repro.sh`'s own preflight and pre-launch idle, AC and parish-media checks passed. It exited 0.
+
+| Measurement | Result |
+| --- | --- |
+| Six lab gates | all pass |
+| Lab speed gate | 108.4 tokens/second; 3,187 tokens in 29.5 s, natural `stop` |
+| Uncapped repeat of the stock speed request | 108.1 tokens/second; 3,984 tokens in 34.3 s, natural `stop` |
+| Context recall | 106,242 input tokens; correct code; 66.9 seconds |
+| Lab-reported prefill | 1,588 tokens/second |
+| Chat completions | exactly 7; HTTP 200; none set `max_tokens`, `max_completion_tokens`, `stop` or `seed`; four JSON answers end with `stop`, the tool call with `tool_calls` (`get_weather`, Paris), and both streams with `stop` and `[DONE]` |
+| Peak GPU memory | 7,862 MiB of 12,282 MiB (52 MiB in the quiet baseline) |
+| GPU utilization / power, quiet 60 s baseline vs run | 8–13 % / 8.4 W vs up to 100 % / 198.1 W |
+| Host MemAvailable low point / swap | 20.24 GB (24.53–24.81 GB at baseline) / 4.14–4.19 GB |
+| Host CPU (vmstat us+sy), baseline vs run | mean 4.2 % vs 7.6 %, max 16 % |
+| Cleanup | server log saved (78 lines), container removed and confirmed gone, helper gone, verdict after 2 s of the 540 s reserve |
+
+Evidence, all byte for byte from the run:
+- [run JSON](../../lab-runs/rtx-4080-laptop-12gb.qwen3.5-9b.tabbyapi-qwen3.5-9b-exl3-4bpw-128k.128k.20261025T060529.json): SHA256 8f0c4b5c8637b96af107f4063c25fc4fc0833cb5fb04a781b8c2a2720ea9362d, recipe log hash sha256:c5889d9fc4b219b7.
+- The stock lab added this proof ahead of the first one in the recipe. The first proof is unchanged.
+- [repro.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.repro.log), [server.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.server.log), [postconditions.json](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.postconditions.json) and [speed-repeat.json](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.speed-repeat.json).
+- [raw-recorder.tar.gz](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.raw-recorder.tar.gz): 44 body files (every request and response, including both full SSE streams), `recorder.jsonl` and `SHA256SUMS`. Archive SHA256 c2c8823c3198ab6856b5c75729dc9cc5b36e2623701fc86e119b4924fbeafa52 ([.sha256](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.raw-recorder.tar.gz.sha256)).
+- The quiet baseline and run metrics came from task watchers, not from `repro.sh` or the kit: [memwatch-native.csv](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.memwatch-native.csv) (1 s samples) and [vmstat.txt](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.vmstat.txt), started 60 s before `repro.sh` by a wrapper whose log is [confirm.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.confirm.log).
+
+Limits: one confirmation run on one laptop card, through the manual device mapping described above (no NVIDIA Container Toolkit). The kit panel and full kit sweep were not run.
