@@ -197,6 +197,16 @@ exec "$FAKE_REAL_DATE" "$@"
 '''
 
 
+PGREP = r"""#!/usr/bin/env bash
+# fake pgrep: the real one, unless FAKE_PGREP_ERROR (from the start) or FAKE_PGREP_ERROR_AFTER_RUN (once the
+# container exists) names an exit status to return instead, as a failing or missing pgrep would
+code=${FAKE_PGREP_ERROR:-}
+[ -z "$code" ] && [ -n "${FAKE_PGREP_ERROR_AFTER_RUN:-}" ] && [ -e "$FAKE_STATE/started" ] && code=$FAKE_PGREP_ERROR_AFTER_RUN
+[ -n "$code" ] && exit "$code"
+exec "$FAKE_REAL_PGREP" "$@"
+"""
+
+
 def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
@@ -225,14 +235,14 @@ class Repro(unittest.TestCase):
             for l in links:
                 os.symlink(real, os.path.join(self.libdir, l))
         self.bin = os.path.join(self.t, "bin"); os.makedirs(self.bin)
-        for name, text in (("podman", PODMAN), ("nvidia-smi", NVSMI), ("date", DATE)):
+        for name, text in (("podman", PODMAN), ("nvidia-smi", NVSMI), ("date", DATE), ("pgrep", PGREP)):
             p = os.path.join(self.bin, name); open(p, "w").write(text); os.chmod(p, 0o755)
         self.state = os.path.join(self.t, "state"); os.makedirs(os.path.join(self.state, "c"))
         self.store = os.path.join(self.t, "store")
         self.home = os.path.join(self.t, "home"); os.makedirs(self.home)
         path = ":".join(d for d in os.environ["PATH"].split(":") if ".local/bin" not in d and "mise" not in d)  # no real parish-media
         self.env = {**os.environ, "HOME": self.home, "PATH": self.bin + ":" + path, "FAKE_STATE": self.state, "FAKE_PY": sys.executable,
-                    "FAKE_TEST": os.path.join(self.repo, REL, "test_repro.py"), "FAKE_DIGEST": DIGEST, "FAKE_REAL_DATE": shutil.which("date"), "MODEL_DIR": self.model, "STORE": self.store,
+                    "FAKE_TEST": os.path.join(self.repo, REL, "test_repro.py"), "FAKE_DIGEST": DIGEST, "FAKE_REAL_DATE": shutil.which("date"), "FAKE_REAL_PGREP": shutil.which("pgrep"), "MODEL_DIR": self.model, "STORE": self.store,
                     "LIBDIR": self.libdir, "SERVER_PORT": str(free_port()), "REC_PORT": str(free_port()), "PYTHON": sys.executable,
                     "HEALTH_TIMEOUT": "60", "LAB_TIMEOUT": "300", "REPEAT_TIMEOUT": "120", "REPRO_TIMEOUT": "600"}
         self.env.pop("SYBIL_REPRO_BOUNDED", None)
@@ -428,6 +438,27 @@ class Repro(unittest.TestCase):
         left = subprocess.run(["pgrep", "-f", f"^sleep {self.hang}$"], capture_output=True, text=True).stdout.split()
         self.assertEqual(left, [], "the grandchild survived the stage")
         self.assertClean()
+
+    # ---- Codex r2: a pgrep error is not "empty". From the start: the first stage fails closed (exit 9) and
+    # cleanup reports ok=0. Once the container exists: the same, and the container is still removed.
+    def assertPgrepErrorFailsClosed(self, **env):
+        import re
+        rc = self.run_repro(**env)
+        self.assertEqual(rc, 9, self.out[-2000:])
+        self.assertIn("cannot be confirmed empty", self.out)
+        self.assertTrue(re.search(r"cleanup verdict: ok=0 after \d+s", self.out), self.out[-2000:])
+        self.assertClean()
+
+    def test_pgrep_error_from_start(self):
+        self.assertPgrepErrorFailsClosed(FAKE_PGREP_ERROR="2")
+
+    def test_pgrep_missing_from_start(self):
+        self.assertPgrepErrorFailsClosed(FAKE_PGREP_ERROR="127")
+
+    def test_pgrep_error_once_container_exists(self):
+        self.assertPgrepErrorFailsClosed(FAKE_PGREP_ERROR_AFTER_RUN="2")
+        self.assertIn("run -d", self.calls())
+        self.assertIn("removed (positively gone)", self.out)
 
     # ---- Tier 2 r1 F6: [DONE] reaches the client half a second before the stream closes
     def test_late_eof_after_done(self):
@@ -630,9 +661,36 @@ stop_stage; echo "cleanup_rc=$?" """)
         self.assertRegex(r.stdout, r"FAIL 9 STAGE=\[\d+\]")  # the identity is kept for cleanup
         self.assertNotIn("returned rc=", r.stdout)
 
+    QUERY_ERROR = 'pgrep() { return 2; }; kill() { echo "kill sent: $*"; }'
+    MISSING = 'pgrep() { return 127; }; kill() { echo "kill sent: $*"; }'
+
+    def assertFailsClosed(self, r):
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"FAIL 9 STAGE=\[\d+\]")  # the identity is kept for cleanup
+        self.assertIn("cannot be confirmed empty", r.stdout)
+        self.assertNotIn("returned rc=", r.stdout)
+        self.assertNotIn("kill sent: -KILL", r.stdout)  # no KILL to a group that cannot be seen
+
+    def test_query_error_on_own_deadline_fails_closed(self):  # Codex r2: pgrep exit 2 after stage 1 1
+        self.assertFailsClosed(self.bash(
+            f'stage 1 1 bash -c "exec > /dev/null 2>&1; (trap \'\' TERM; exec sleep {self.n}) & exec sleep 100"; echo "returned rc=$?"',
+            pre=self.QUERY_ERROR))
+
+    def test_query_error_after_a_clean_stage_fails_closed(self):
+        self.assertFailsClosed(self.bash('stage 10 1 true; echo "returned rc=$?"', pre=self.QUERY_ERROR))
+
+    def test_missing_pgrep_fails_closed(self):
+        self.assertFailsClosed(self.bash('stage 10 1 true; echo "returned rc=$?"', pre=self.MISSING))
+
+    def test_query_error_in_stop_stage(self):
+        r = self.bash('sleep 0.1 & STAGE=$!; STAGE_T=x; wait; stop_stage; echo "stop_rc=$?"', pre=self.QUERY_ERROR)
+        self.assertIn("stop_rc=1", r.stdout, r.stdout + r.stderr)
+        self.assertIn("cannot be confirmed empty", r.stdout)
+        self.assertNotIn("kill sent: -KILL", r.stdout)
+
     def test_stop_stage_reports_a_group_it_cannot_empty(self):
         r = self.bash('sleep 0.1 & STAGE=$!; STAGE_T=x; wait; stop_stage; echo "stop_rc=$?"', pre=self.UNKILLABLE)
-        self.assertIn("survived KILL", r.stdout); self.assertIn("stop_rc=1", r.stdout)
+        self.assertIn("could not be confirmed empty", r.stdout); self.assertIn("stop_rc=1", r.stdout)
 
 
 class RecorderShutdown(unittest.TestCase):

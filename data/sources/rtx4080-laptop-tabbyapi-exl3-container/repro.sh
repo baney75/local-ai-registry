@@ -41,7 +41,9 @@
 # its own process group, and the script waits for it. A signal interrupts that wait at once; cleanup then
 # stops the stage first: TERM to its `timeout` (which passes it on to the stage and its group and KILLs
 # them after K s), then KILL to whatever of that process group is left, then a check that nothing of it
-# remains. Only short calls run in the foreground; the longest is `parish-media status` (timeout -k 5 20).
+# remains. A stage that ends by itself gets the same check. Only `pgrep` exit 1 counts as "empty"; a pgrep
+# error or a missing pgrep fails closed (exit 9, the stage kept for cleanup, cleanup ok=0). Only short
+# calls run in the foreground; the longest is `parish-media status` (timeout -k 5 20).
 #
 # Cleanup reserve. On REPRO_TIMEOUT the outer `timeout` sends TERM and allows CLEANUP_RESERVE seconds before
 # KILL. Every cleanup step has its own `timeout -k 5 B` (worst case B + 5 s), so the reserve covers the worst
@@ -138,18 +140,34 @@ stage() {
   # `timeout` exits 124 as soon as its child is gone, before its -k KILL reaches a grandchild that ignores
   # TERM; a finished stage can also leave a background child behind. The identity stays set until the
   # group is confirmed empty, so a failure here still leaves cleanup something to find.
-  empty_group "$STAGE" || fail 9 "stage process group $STAGE survived KILL"
+  empty_group "$STAGE" || fail 9 "stage process group $STAGE could not be confirmed empty"
   STAGE=; STAGE_T=
   return "$rc"
 }
-# KILL whatever is left in process group $1 and wait (up to 5 s) until nothing of it remains.
+# Is anything left in process group $1? 0: yes; 1: confirmed empty (pgrep found no match); 2: unknown (pgrep
+# failed or is missing). Unknown never counts as empty.
+group_state() {
+  local rc
+  pgrep -g "$1" > /dev/null 2>&1; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) stamp "pgrep -g $1 failed (exit $rc): the stage's process group cannot be confirmed empty"; return 2 ;;
+  esac
+}
+# KILL whatever is left in process group $1 and wait (up to 5 s) until it is confirmed empty. Fails (1) if it
+# stays non-empty or if the query fails; a failed query sends no KILL, since the group can no longer be seen.
 empty_group() {
-  local g=$1 i
-  pgrep -g "$g" > /dev/null 2>&1 || return 0
+  local g=$1 i rc
+  group_state "$g"; rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 0 ] || return 1
   stamp "stage process group $g outlived its timeout; KILLing what is left"
   kill -KILL -- "-$g" 2>/dev/null
   for i in $(seq 1 25); do
-    pgrep -g "$g" > /dev/null 2>&1 || return 0
+    group_state "$g"; rc=$?
+    [ "$rc" -eq 1 ] && return 0
+    [ "$rc" -eq 0 ] || return 1
     sleep 0.2
   done
   return 1
@@ -168,7 +186,7 @@ stop_stage() {
       sleep 0.2
     done
   fi
-  empty_group "$pid" || { stamp "stage process group $pid survived KILL"; return 1; }
+  empty_group "$pid" || { stamp "stage process group $pid could not be confirmed empty"; return 1; }
   wait "$pid" 2>/dev/null
   STAGE=; STAGE_T=
   return 0
@@ -318,6 +336,7 @@ flock -n 9 || fail 7 "another run holds $STORE/repro.lock"
 
 # 1. Inputs
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || fail 4 "Python 3.11 or newer is required"
+command -v pgrep > /dev/null || fail 4 "pgrep (procps) is required: stage process groups are checked with it"
 [ "$(sha256sum "$ROOT/lab/lab.py" | cut -d' ' -f1)" = "$LAB_SHA" ] || fail 4 "lab/lab.py is not the stock lab"
 stage 60 5 "$PYTHON" -I -B -c '
 import json, sys
