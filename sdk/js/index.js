@@ -145,10 +145,13 @@ const HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*
 // pip sees no config file (PIP_CONFIG_FILE=/dev/null turns off every one, which --isolated does not), and its temp files,
 // home and cache are inside the packages staging directory.
 const PIPENV = "pipenv() { h=$(cd -P \"$1\" && pwd -P)/.pip; mkdir -p \"$h/tmp\" \"$h/home\" \"$h/cache\"; PIP_CONFIG_FILE=/dev/null; TMPDIR=$h/tmp; TMP=$h/tmp; TEMP=$h/tmp; HOME=$h/home; XDG_CACHE_HOME=$h/cache; XDG_CONFIG_HOME=$h/home/.config; export PIP_CONFIG_FILE TMPDIR TMP TEMP HOME XDG_CACHE_HOME XDG_CONFIG_HOME; }";
-const KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }';
-const CLEAN = `c= o= t=\ntrap 'for x in "$c" "$o" "$t"; do if [ -n "$x" ]; then rm -rf "$x"; fi; done' EXIT`;
-const HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; ' +
-  'if [ -e "$o/old" ]; then rm -rf "$1"; mv "$o/old" "$1" || keep "$o/old"; fi; exit 1; }';
+// Every step's exit, by success, failure or a signal (TERM, INT, HUP), goes through fin: while a publication is unfinished
+// (pub set) the step's back() puts the previous installation back first, and if that fails the backup is kept (named on
+// stderr) and the step fails; only then are the staging directories removed. The same text in both SDKs.
+const TXN = "pub= c= o= s= t= w=\nfin() { rc=${1:-$?}; trap - EXIT TERM INT HUP; if [ -n \"$pub\" ] && ! back; then for k in ${s:+\"$s/old\"} ${o:+\"$o/old\"}; do if [ -e \"$k\" ]; then echo \"local-ai: could not restore it; the previous copy is kept in $k\" >&2; fi; done; exit 1; fi; for x in \"$c\" \"$o\" \"$s\" \"$t\" \"$w\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done; exit \"$rc\"; }\ntrap fin EXIT; trap 'fin 143' TERM; trap 'fin 130' INT; trap 'fin 129' HUP";
+const HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; exit 1; }';
+// the hub model directory being published: m (live) and ms (staged); the new one is placed once ms is gone
+const HUBBACK = "back() { ok=0; if [ ! -e \"$ms\" ]; then rm -rf \"$m\" || ok=1; fi; if [ -e \"$o/old\" ]; then mv \"$o/old\" \"$m\" || ok=1; fi; return $ok; }";
 /** `a/b/c` -> `a a/b a/b/c`: every directory a write to `path` passes through, quoted. */
 const prefixes = (path) => path.split("/").map((_, i, p) => q(p.slice(0, i + 1).join("/"))).join(" ");
 const parent = (path) => (path.includes("/") ? path.replace(/\/[^/]*$/, "") : ".");
@@ -165,10 +168,10 @@ function runtimeSteps(l) {
     const keep = owned(l).map(([, x]) => x).filter((x) => x.toLowerCase().startsWith(`${into.toLowerCase()}/`));  // ignoring case, as macOS does
     out.push({ title: "Install the runtime", code: strict([
       NOLINK,
+      TXN,
       `nolink ${prefixes(into)}`,
       `mkdir -p ${d}`,
       `s=$(mktemp -d ${d}/.local-ai-runtime.XXXXXX)`,
-      `trap 'rm -rf "$s"' EXIT`,
       `curl -q -fL -o "$s"/${q(f)} ${q(a.url)}`,
       `(cd "$s" && echo '${a.sha256}  ${f}' | shasum -a 256 -c -)`,
       'mkdir "$s/x" "$s/old"',
@@ -184,26 +187,28 @@ function runtimeSteps(l) {
       CONFINE,
       'confine "$s/x"',
       ...(rt.python ? [`test -f "$s"/x/${q(rt.python.slice(into.length + 1))}`, `"$s"/x/${q(rt.python.slice(into.length + 1))} -I -c pass`] : []),
-      KEEP,
-      'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; ' +
-      `for n in $placed; do rm -rf ${d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf ${d}/"$n"; mv "$s/old/$n" ${d}/"$n" || keep "$s/old"; done; exit 1; }`,
-      "placed=",
-      'for n in $(ls -A "$s/x"); do',
+      'entries=$(ls -A "$s/x")',
+      // an entry gone from $s/x was placed (rename is atomic): remove it; then put every backed-up entry back
+      `back() { ok=0; for n in $entries; do if [ ! -e "$s/x/$n" ] && [ ! -L "$s/x/$n" ]; then rm -rf ${d}/"$n" || ok=1; fi; done; ` +
+      `for n in $(ls -A "$s/old"); do rm -rf ${d}/"$n" || ok=1; mv "$s/old/$n" ${d}/"$n" || ok=1; done; return $ok; }`,
+      'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; exit 1; }',
+      "pub=1",
+      'for n in $entries; do',
       `  if [ -e ${d}/"$n" ]; then mv ${d}/"$n" "$s/old/$n" || undo; fi`,
       `  mv "$s/x/$n" ${d}/"$n" || undo`,
-      '  placed="$placed $n"',
-      "done"]) });
+      "done",
+      "pub="]) });
   }
   if (rt.packages) {
     const pk = rt.packages, d = q(pk.dir), t = q(pk.target), fs = pk.wheels.map((w) => urlFile(w.url));
     out.push({ title: "Install the packages", code: strict([
       NOLINK,
+      TXN,
       `nolink ${prefixes(pk.dir)} ${prefixes(pk.target)}`,
       `mkdir -p ${q(parent(pk.dir))} ${q(parent(pk.target))}`,
       `w=$(mktemp -d ${q(parent(pk.dir))}/.local-ai-wheels.XXXXXX)`,
       `o=$(mktemp -d ${q(parent(pk.dir))}/.local-ai-old.XXXXXX)`,
       `s=$(mktemp -d ${q(parent(pk.target))}/.local-ai-packages.XXXXXX)`,
-      `trap 'rm -rf "$w" "$o" "$s"' EXIT`,
       ...pk.wheels.map((w, i) => `curl -q -fL -o "$w"/${q(fs[i])} ${q(w.url)}`),
       `printf '%s\\n' ${pk.wheels.map((w, i) => q(`${w.sha256}  ${fs[i]}`)).join(" ")} > "$w/SHA256SUMS"`,
       '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
@@ -212,14 +217,16 @@ function runtimeSteps(l) {
       `(pipenv "$s"; exec ${q(`./${rt.python}`)} -I -m pip --isolated install --no-index --find-links "$w" --only-binary :all: --require-hashes ` +
       '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --no-cache-dir --disable-pip-version-check)',
       `nolink ${t} ${d}`,
-      KEEP,
-      'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; ' +
-      `if [ -e "$s/old" ]; then rm -rf ${t}; mv "$s/old" ${t} || keep "$s/old"; elif [ ! -e "$s/t" ]; then rm -rf ${t}; fi; ` +
-      `if [ -e "$o/old" ]; then rm -rf ${d}; mv "$o/old" ${d} || keep "$o/old"; elif [ ! -e "$w" ]; then rm -rf ${d}; fi; exit 1; }`,
+      // the new target and wheel dir are placed once "$s/t" and "$w" are gone; the old ones wait in $s/old and $o/old
+      `back() { ok=0; if [ ! -e "$s/t" ]; then rm -rf ${t} || ok=1; fi; if [ -e "$s/old" ]; then mv "$s/old" ${t} || ok=1; fi; ` +
+      `if [ ! -e "$w" ]; then rm -rf ${d} || ok=1; fi; if [ -e "$o/old" ]; then mv "$o/old" ${d} || ok=1; fi; return $ok; }`,
+      'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; exit 1; }',
+      "pub=1",
       `if [ -e ${t} ]; then mv ${t} "$s/old" || undo; fi`,
       `mv "$s/t" ${t} || undo`,
       `if [ -e ${d} ]; then mv ${d} "$o/old" || undo; fi`,
-      `mv "$w" ${d} || undo`]) });
+      `mv "$w" ${d} || undo`,
+      "pub="]) });
   }
   return out;
 }
@@ -248,8 +255,9 @@ function hostDownload(w, rt) {
     `test -d ${staged}/snapshots/${rev}`, `confine ${staged}`];
   if (w.ref) lines.push(`mkdir -p ${staged}/refs`, `nolink ${staged}/refs`,
     ...write(`${staged}/refs`, `${staged}/refs/${q(w.ref)}`, `refs/${w.ref}`, (t) => [`printf '%s' ${rev} > ${t}`]));
-  return [...lines, `nolink ${prefixes(at)} ${m}`, `if [ -e ${m} ]; then mv ${m} "$o/old" || hubundo ${m}; fi`,
-    `mv ${staged} ${m} || hubundo ${m}`, 'rm -rf "$c" "$o"', "c= o="];
+  return [...lines, `nolink ${prefixes(at)} ${m}`, `m=${m}`, `ms=${staged}`, "pub=1",
+    'if [ -e "$m" ]; then mv "$m" "$o/old" || hubundo "$m"; fi', 'mv "$ms" "$m" || hubundo "$m"',
+    "pub=", 'rm -rf "$c" "$o"', "c= o="];
 }
 
 /** A program on the host. One with pinned packages or weights (MLX, oMLX or llama.cpp on Apple silicon) also downloads
@@ -267,12 +275,12 @@ function hostSteps(l) {
     if (l.pip && /^https:\/\/\S+\.tar\.gz#sha256=[0-9a-f]{64}$/.test(l.install ?? "")) out.push({ title: "Install the native engine", code: install(l.install) });
   }
   if (l.weights?.length) {
-    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, CLEAN, KEEP, HUBUNDO, CONFINE, HUBENV, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
+    if (l.weights.some((w) => w.layout === "hub")) out.push({ title: "Download the weights", code: strict([NOLINK, TXN, HUBBACK, HUBUNDO, CONFINE, HUBENV, ...l.weights.flatMap((w) => hostDownload(w, rt))]) });
     else out.push({ title: "Download the weights", code: l.weights.map((w) => hostDownload(w)).join("\n\n") });
   }
   if (l.config) {
     const at = l.config.at;
-    if (confined(l)) out.push({ title: "Write the launcher", code: strict([NOLINK, CLEAN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
+    if (confined(l)) out.push({ title: "Write the launcher", code: strict([NOLINK, TXN, `nolink ${prefixes(at)}`, `mkdir -p ${q(parent(at))}`,
       ...write(q(parent(at)), q(at), at, (t) => [`cat > ${t} <<'EOF'\n${l.config.text.trimEnd()}\nEOF`])]) });
     else out.push({ title: "Write the launcher", code: `${at.includes("/") ? `mkdir -p ${at.replace(/\/[^/]*$/, "")}\n` : ""}cat > ${at} <<'EOF'\n${l.config.text.trimEnd()}\nEOF` });
   }

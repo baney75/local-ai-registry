@@ -74,8 +74,11 @@ Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is r
   a plain name, must not be a link in `into`, and must not hold another step's destination, compared ignoring case (an
   entry `SITE` holds `rt/site`, and so does `site` when the target is `RT/site`); and the staged interpreter
   (so resolved inside the archive) must exist and run. Only then does each entry replace the
-  one in `into` by rename. If a rename fails, every entry already moved is put back, so the previous runtime stays whole
-  and usable; if putting it back fails too, the previous copy is kept (not deleted) and the step says where. Other files in
+  one in `into` by rename. If the publication does not finish (a rename fails, or the step is stopped by TERM, INT or
+  HUP), every entry already moved is put back before anything is cleaned up, so the previous runtime stays whole and
+  usable; if putting it back fails too, the previous copy is kept (not deleted), the step says where and fails. The same
+  holds for the packages target and wheel dir and for a hub model directory. A KILL cannot be caught: it leaves the
+  staging and backup directories in place, never deletes them. Other files in
   `into` (packages, weights, the launcher) are kept.
 - `python`: the interpreter, a relative path inside `into`, run as `./<python>`, never looked up on `PATH`.
 - `packages: {dir, target, wheels: [{name, version, url, sha256}]}` (needs `python`; `dir` and `target` do not overlap):

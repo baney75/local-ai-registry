@@ -206,10 +206,13 @@ _HUBENV = "hubenv() { for v in $(env | sed -n 's/^\\(HF_[A-Za-z0-9_]*\\)=.*/\\1/
 _PIPENV = "pipenv() { h=$(cd -P \"$1\" && pwd -P)/.pip; mkdir -p \"$h/tmp\" \"$h/home\" \"$h/cache\"; PIP_CONFIG_FILE=/dev/null; TMPDIR=$h/tmp; TMP=$h/tmp; TEMP=$h/tmp; HOME=$h/home; XDG_CACHE_HOME=$h/cache; XDG_CONFIG_HOME=$h/home/.config; export PIP_CONFIG_FILE TMPDIR TMP TEMP HOME XDG_CACHE_HOME XDG_CONFIG_HOME; }"
 
 
-_HUBUNDO = ('hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; '
-            'if [ -e "$o/old" ]; then rm -rf "$1"; mv "$o/old" "$1" || keep "$o/old"; fi; exit 1; }')
-_KEEP = 'keep() { trap - EXIT; echo "local-ai: could not restore it; the previous copy is kept in $1" >&2; exit 1; }'
-_CLEAN = "c= o= t=\ntrap 'for x in \"$c\" \"$o\" \"$t\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done' EXIT"
+# Every step's exit, by success, failure or a signal (TERM, INT, HUP), goes through fin: while a publication is unfinished
+# (pub set) the step's back() puts the previous installation back first, and if that fails the backup is kept (named on
+# stderr) and the step fails; only then are the staging directories removed. The same text in both SDKs.
+_TXN = "pub= c= o= s= t= w=\nfin() { rc=${1:-$?}; trap - EXIT TERM INT HUP; if [ -n \"$pub\" ] && ! back; then for k in ${s:+\"$s/old\"} ${o:+\"$o/old\"}; do if [ -e \"$k\" ]; then echo \"local-ai: could not restore it; the previous copy is kept in $k\" >&2; fi; done; exit 1; fi; for x in \"$c\" \"$o\" \"$s\" \"$t\" \"$w\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done; exit \"$rc\"; }\ntrap fin EXIT; trap 'fin 143' TERM; trap 'fin 130' INT; trap 'fin 129' HUP"
+_HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; exit 1; }'
+# the hub model directory being published: m (live) and ms (staged); the new one is placed once ms is gone
+_HUBBACK = "back() { ok=0; if [ ! -e \"$ms\" ]; then rm -rf \"$m\" || ok=1; fi; if [ -e \"$o/old\" ]; then mv \"$o/old\" \"$m\" || ok=1; fi; return $ok; }"
 
 
 def _prefixes(path):
@@ -238,10 +241,10 @@ def _runtime_steps(l):
         keep = [x for _, x in _owned(l) if x.lower().startswith(into.lower() + "/")]  # ignoring case, as macOS does
         out.append({"title": "Install the runtime", "code": _strict([
             _NOLINK,
+            _TXN,
             f"nolink {_prefixes(into)}",
             f"mkdir -p {d}",
             f"s=$(mktemp -d {d}/.local-ai-runtime.XXXXXX)",
-            "trap 'rm -rf \"$s\"' EXIT",
             f'curl -q -fL -o "$s"/{_q(f)} {_q(a["url"])}',
             f"(cd \"$s\" && echo '{a['sha256']}  {f}' | shasum -a 256 -c -)",
             'mkdir "$s/x" "$s/old"',
@@ -257,27 +260,29 @@ def _runtime_steps(l):
             _CONFINE,
             'confine "$s/x"',
             *([f'test -f "$s"/x/{_q(rt["python"][len(into) + 1:])}', f'"$s"/x/{_q(rt["python"][len(into) + 1:])} -I -c pass'] if rt.get("python") else []),
-            _KEEP,
-            'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; '
-            f'for n in $placed; do rm -rf {d}/"$n"; done; for n in $(ls -A "$s/old"); do rm -rf {d}/"$n"; mv "$s/old/$n" {d}/"$n" || keep "$s/old"; done; exit 1; }}',
-            "placed=",
-            'for n in $(ls -A "$s/x"); do',
+            'entries=$(ls -A "$s/x")',
+            # an entry gone from $s/x was placed (rename is atomic): remove it; then put every backed-up entry back
+            f'back() {{ ok=0; for n in $entries; do if [ ! -e "$s/x/$n" ] && [ ! -L "$s/x/$n" ]; then rm -rf {d}/"$n" || ok=1; fi; done; '
+            f'for n in $(ls -A "$s/old"); do rm -rf {d}/"$n" || ok=1; mv "$s/old/$n" {d}/"$n" || ok=1; done; return $ok; }}',
+            'undo() { echo "local-ai: could not publish the runtime; restoring the previous one" >&2; exit 1; }',
+            "pub=1",
+            'for n in $entries; do',
             f'  if [ -e {d}/"$n" ]; then mv {d}/"$n" "$s/old/$n" || undo; fi',
             f'  mv "$s/x/$n" {d}/"$n" || undo',
-            '  placed="$placed $n"',
-            "done"])})
+            "done",
+            "pub="])})
     if "packages" in rt:
         pk = rt["packages"]
         d, t = _q(pk["dir"]), _q(pk["target"])
         files = [_url_file(w["url"]) for w in pk["wheels"]]
         out.append({"title": "Install the packages", "code": _strict([
             _NOLINK,
+            _TXN,
             f"nolink {_prefixes(pk['dir'])} {_prefixes(pk['target'])}",
             f"mkdir -p {_q(_parent(pk['dir']))} {_q(_parent(pk['target']))}",
             f"w=$(mktemp -d {_q(_parent(pk['dir']))}/.local-ai-wheels.XXXXXX)",
             f"o=$(mktemp -d {_q(_parent(pk['dir']))}/.local-ai-old.XXXXXX)",
             f"s=$(mktemp -d {_q(_parent(pk['target']))}/.local-ai-packages.XXXXXX)",
-            "trap 'rm -rf \"$w\" \"$o\" \"$s\"' EXIT",
             *[f'curl -q -fL -o "$w"/{_q(f)} {_q(w["url"])}' for w, f in zip(pk["wheels"], files)],
             "printf '%s\\n' " + " ".join(_q(f"{w['sha256']}  {f}") for w, f in zip(pk["wheels"], files)) + ' > "$w/SHA256SUMS"',
             '(cd "$w" && shasum -a 256 -c SHA256SUMS)',
@@ -286,14 +291,16 @@ def _runtime_steps(l):
             f"(pipenv \"$s\"; exec {_q('./' + rt['python'])} -I -m pip --isolated install --no-index --find-links \"$w\" --only-binary :all: --require-hashes "
             '-r "$w/requirements.lock.txt" --target "$s/t" --no-compile --no-cache-dir --disable-pip-version-check)',
             f"nolink {t} {d}",
-            _KEEP,
-            'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; '
-            f'if [ -e "$s/old" ]; then rm -rf {t}; mv "$s/old" {t} || keep "$s/old"; elif [ ! -e "$s/t" ]; then rm -rf {t}; fi; '
-            f'if [ -e "$o/old" ]; then rm -rf {d}; mv "$o/old" {d} || keep "$o/old"; elif [ ! -e "$w" ]; then rm -rf {d}; fi; exit 1; }}',
+            # the new target and wheel dir are placed once "$s/t" and "$w" are gone; the old ones wait in $s/old and $o/old
+            f'back() {{ ok=0; if [ ! -e "$s/t" ]; then rm -rf {t} || ok=1; fi; if [ -e "$s/old" ]; then mv "$s/old" {t} || ok=1; fi; '
+            f'if [ ! -e "$w" ]; then rm -rf {d} || ok=1; fi; if [ -e "$o/old" ]; then mv "$o/old" {d} || ok=1; fi; return $ok; }}',
+            'undo() { echo "local-ai: could not publish the packages; restoring the previous ones" >&2; exit 1; }',
+            "pub=1",
             f'if [ -e {t} ]; then mv {t} "$s/old" || undo; fi',
             f'mv "$s/t" {t} || undo',
             f'if [ -e {d} ]; then mv {d} "$o/old" || undo; fi',
-            f'mv "$w" {d} || undo'])})
+            f'mv "$w" {d} || undo',
+            "pub="])})
     return out
 
 
@@ -336,9 +343,10 @@ def _host_download(w, rt=None):
         lines += [f"mkdir -p {staged}/refs", f"nolink {staged}/refs",
                   *_write(f"{staged}/refs", f"{staged}/refs/{_q(w['ref'])}", f"refs/{w['ref']}", lambda t: [f"printf '%s' {rev} > {t}"])]
     return lines + [f"nolink {_prefixes(at)} {m}",
-                    f'if [ -e {m} ]; then mv {m} "$o/old" || hubundo {m}; fi',
-                    f"mv {staged} {m} || hubundo {m}",
-                    'rm -rf "$c" "$o"', "c= o="]
+                    f"m={m}", f"ms={staged}", "pub=1",
+                    'if [ -e "$m" ]; then mv "$m" "$o/old" || hubundo "$m"; fi',
+                    'mv "$ms" "$m" || hubundo "$m"',
+                    "pub=", 'rm -rf "$c" "$o"', "c= o="]
 
 
 def _host_steps(l):
@@ -358,14 +366,14 @@ def _host_steps(l):
             out.append({"title": "Install the native engine", "code": _install(l["install"])})
     if l.get("weights"):
         if any(w.get("layout") == "hub" for w in l["weights"]):  # a cache: checked, confined and stopped at its first failure
-            out.append({"title": "Download the weights", "code": _strict([_NOLINK, _CLEAN, _KEEP, _HUBUNDO, _CONFINE, _HUBENV,
+            out.append({"title": "Download the weights", "code": _strict([_NOLINK, _TXN, _HUBBACK, _HUBUNDO, _CONFINE, _HUBENV,
                                                                          *[x for w in l["weights"] for x in _host_download(w, rt)]])})
         else:
             out.append({"title": "Download the weights", "code": "\n\n".join(_host_download(w) for w in l["weights"])})
     if l.get("config"):
         at = l["config"]["at"]
         if _confined(l):
-            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, _CLEAN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
+            out.append({"title": "Write the launcher", "code": _strict([_NOLINK, _TXN, f"nolink {_prefixes(at)}", f"mkdir -p {_q(_parent(at))}",
                                                                          *_write(_q(_parent(at)), _q(at), at, lambda t: [f"cat > {t} <<'EOF'\n{l['config']['text'].rstrip()}\nEOF"])])})
         else:
             mk = f"mkdir -p {at.rsplit('/', 1)[0]}\n" if "/" in at else ""

@@ -482,7 +482,11 @@ if [ -n "$FAIL_MV_TO" ] && [ "$last" = "$FAIL_MV_TO" ]; then
     *.local-ai-*) echo "mv: injected failure" >&2; exit 1;;
   esac
 fi
-exec /bin/mv "$@"
+# with $FAIL_ANY_RESTORE every move out of .../old (putting a backup back) fails
+if [ -n "$FAIL_ANY_RESTORE" ]; then case "$1" in */old|*/old/*) echo "mv: injected restore failure" >&2; exit 1;; esac; fi
+/bin/mv "$@" || exit
+# after a move from $KILL_FROM to $KILL_TO (glob patterns), signal the step's shell with $KILL_SIG (TERM by default)
+if [ -n "$KILL_FROM" ]; then case "$1" in $KILL_FROM) case "$last" in $KILL_TO) echo "$1 -> $last" >> "$PWD/KILLED"; kill -"${KILL_SIG:-TERM}" "$PPID";; esac;; esac; fi
 '''
 # Anything looked up on PATH or planted in the working directory instead of the pinned runtime: record it and fail.
 TRAP = '#!/bin/sh\necho "$0 $*" >> "$TRAPPED"\nexit 73\n'
@@ -1060,6 +1064,91 @@ class SandboxTest(unittest.TestCase):
             kept = re.search(r'previous copy is kept in (\S+)', r.stderr)
             self.assertTrue(kept, (name, r.stderr))
             self.assertEqual(tree(w / kept.group(1) / 'python'), py, name)  # never deleted, so it can be put back by hand
+
+    # r6: a signal in the middle of a publication restores the previous installation; if restoring fails, the backup is
+    # kept and named. Every publication boundary of each stage, both SDKs, under sh and dash.
+
+    BOUNDARIES = {  # name: (step, move after which the signal comes: from, to)
+        'runtime: a new entry placed': ('Install the runtime', '*/x/aaa-new', 'rt/aaa-new'),
+        'runtime: python backed up': ('Install the runtime', 'rt/python', '*/old/python'),
+        'runtime: python placed': ('Install the runtime', '*/x/python', 'rt/python'),
+        'packages: target backed up': ('Install the packages', 'rt/site', '*/old'),
+        'packages: target placed': ('Install the packages', '*/t', 'rt/site'),
+        'packages: wheel dir backed up': ('Install the packages', 'rt/wheels', '*/old'),
+        'packages: wheel dir placed': ('Install the packages', '*.local-ai-wheels.*', 'rt/wheels'),
+        'hub: model backed up': ('Download the weights', 'rt/hf-cache/models--org--model', '*/old'),
+        'hub: model placed': ('Download the weights', '*/.local-ai-hub.*/models--org--model', 'rt/hf-cache/models--org--model'),
+    }
+    MARKED = ('rt/python', 'rt/site', 'rt/wheels', 'rt/hf-cache/models--org--model')
+
+    def installed(self):
+        """A complete installation, every output marked so a replaced or lost one shows; and the rerun's launch, whose
+        archive adds an entry (aaa-new) so a half-published runtime shows too."""
+        (self.server / ARCHIVE).write_bytes(self.archive_bytes)
+        base = self.work()
+        for title in ('Install the runtime', 'Install the packages', 'Download the weights', 'Write the launcher'):
+            self.assertEqual(self.step(self.L(), title, base).returncode, 0, title)
+        for rel in self.MARKED:
+            (base / rel / 'KEEP').write_text('the previous installation\n')
+        again = self.crafted([('aaa-new/x', 'file', 'new\n', 0o644),
+                              ('python/bin/python3', 'file', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', 0o755)])
+        return base, again
+
+    def install_tree(self, w):
+        """The installation itself (not the test's own records such as PIP_ENV in the work dir)."""
+        return {'rt': tree(w / 'rt'), 'launcher': tree(w / 'launcher')}
+
+    def interrupt(self, base, L, title, src, dst, name, shell, **env):
+        w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
+        code = next(s['code'] for s in renderings(L)[name] if s['title'] == title)
+        r = self.sh(code, w, shell, KILL_FROM=src, KILL_TO=dst, **env)
+        self.assertTrue((w / 'KILLED').exists(), f'the boundary {src} -> {dst} was never reached')
+        (w / 'KILLED').unlink()
+        return w, r
+
+    def test_signal_mid_publication_restores_the_previous_installation(self):
+        base, again = self.installed()
+        was = self.install_tree(base)
+        for case, (title, src, dst) in self.BOUNDARIES.items():
+            for name in ('python', 'js') if NODE else ('python',):
+                for shell in [('sh', '-c')] + ([('dash', '-c')] if shutil.which('dash') else []):
+                    with self.subTest(case=case, sdk=name, shell=shell[0]):
+                        w, r = self.interrupt(base, again, title, src, dst, name, shell)
+                        self.assertEqual(r.returncode, 143, (case, name, shell, r.stderr[-800:]))
+                        self.assertEqual(self.install_tree(w), was, f'{case} ({name}, {shell[0]}): the previous installation was not restored')
+                        self.assertEqual(staging_left(w), [], (case, name, shell))
+                        ok = subprocess.run(['rt/python/bin/python3', '-I', '-c', 'import sys; sys.path.insert(0, "rt/site"); import fixture_a'], cwd=w)
+                        self.assertEqual(ok.returncode, 0, (case, name, shell))
+
+    def test_int_and_hup_mid_publication_restore_too(self):
+        base, again = self.installed()
+        was = self.install_tree(base)
+        for sig, rc in (('INT', 130), ('HUP', 129)):
+            for case in ('runtime: python backed up', 'packages: target placed', 'hub: model backed up'):
+                title, src, dst = self.BOUNDARIES[case]
+                for name in ('python', 'js') if NODE else ('python',):
+                    for shell in [('sh', '-c')] + ([('dash', '-c')] if shutil.which('dash') else []):
+                        with self.subTest(sig=sig, case=case, sdk=name, shell=shell[0]):
+                            w, r = self.interrupt(base, again, title, src, dst, name, shell, KILL_SIG=sig)
+                            self.assertEqual(r.returncode, rc, (sig, case, name, shell, r.stderr[-800:]))
+                            self.assertEqual(self.install_tree(w), was, f'{sig} {case} ({name}, {shell[0]}): not restored')
+                            self.assertEqual(staging_left(w), [], (sig, case, name, shell))
+
+    def test_signal_with_a_failing_restore_keeps_the_backup(self):
+        base, again = self.installed()
+        cases = {'runtime: python backed up': 'rt/python', 'packages: target backed up': 'rt/site',
+                 'packages: wheel dir backed up': 'rt/wheels', 'hub: model backed up': 'rt/hf-cache/models--org--model'}
+        for case, live in cases.items():
+            title, src, dst = self.BOUNDARIES[case]
+            for name in ('python', 'js') if NODE else ('python',):
+                with self.subTest(case=case, sdk=name):
+                    w, r = self.interrupt(base, again, title, src, dst, name, ('sh', '-c'), FAIL_ANY_RESTORE='1')
+                    self.assertNotEqual(r.returncode, 0, (case, name))
+                    kept = re.findall(r'previous copy is kept in (\S+)', r.stderr)
+                    self.assertTrue(kept, f'{case} ({name}): no backup named: {r.stderr[-600:]}')
+                    # the named backup holds the previous output, byte for byte
+                    held = [k for k in kept if tree(w / k / Path(live).name if case.startswith('runtime') else w / k) == tree(base / live)]
+                    self.assertTrue(held, f'{case} ({name}): the previous {live} is not in {kept}')
 
     def test_failed_package_publish_restores_both(self):
         base = self.work(); self.install(base)
