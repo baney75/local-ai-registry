@@ -13,7 +13,11 @@ Teardown, per round (SIGTERM, wait up to 15 s, then SIGKILL, wait up to 5 s):
   - signal the whole group with killpg only if every process currently in that group is a recorded identity;
     otherwise skip killpg and log the unknown members;
   - signal each recorded identity that is still alive, rechecking its start time right before the signal.
-Then verify that no recorded identity survives. Zombies count as dead; the supervisor reaps its own child.
+Then verify that no recorded identity survives, and that its own child has exited (its Popen handle, not ps, says so;
+that child is signalled through the handle too, recorded or not). Zombies count as dead; the supervisor reaps its own
+child. A process table counts only when ps exits 0, every line parses, and the table holds the supervisor itself: any
+other answer raises, so nothing is ever read as gone because a query failed. With the memory guard armed, three
+memory readings in a row that fail (memory_pressure or sysctl exit nonzero, or print nothing usable) tear it down.
 `stop` signals the supervisor only after its pid, start time and exact argv (as ps showed them when `run` began) match.
 Log: DIR/groupwatch.log. Exit of `run`: CMD's exit code, or 3 when the guard, trigger, cap or a stop tore it down; a
 teardown that leaves a recorded process alive, or fails, exits 4 instead (CMD's own nonzero code is kept). If the
@@ -35,17 +39,29 @@ MONITOR_FAILED = 5  # exit code when supervision failed after the command starte
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
+class Telemetry(RuntimeError):
+    pass  # a process or memory query that failed or answered something unusable
+
+
 def ps_table():
-    """pid -> (ppid, pgid, lstart, args). Zombies (stat Z) are dead for our purposes and left out."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,lstart=,args="], capture_output=True, text=True, timeout=10).stdout
+    """pid -> (ppid, pgid, lstart, args). Zombies (stat Z) are dead for our purposes and left out. Raises Telemetry unless
+    ps exits 0, every line parses, and the table holds this process: an empty or partial answer is never "all gone"."""
+    r = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,lstart=,args="], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise Telemetry(f"ps exited {r.returncode}: {(r.stderr or '').strip()[:200]}")
     t = {}
-    for line in out.splitlines():
-        p = line.split(None, 4)
-        if len(p) < 5 or p[3].startswith("Z"):
+    for line in r.stdout.splitlines():
+        if not line.strip():
             continue
-        rest = p[4]  # lstart is 5 words ("Fri Oct 23 16:41:51 2026"), then args
-        w = rest.split(None, 5)
+        p = line.split(None, 4)
+        w = p[4].split(None, 5) if len(p) == 5 else []  # lstart is 5 words ("Fri Oct 23 16:41:51 2026"), then args
+        if len(w) < 5 or not all(x.lstrip("-").isdigit() for x in p[:3]):
+            raise Telemetry(f"ps printed a line it should not have: {line[:200]!r}")
+        if p[3].startswith("Z"):
+            continue
         t[int(p[0])] = (int(p[1]), int(p[2]), " ".join(w[:5]), w[5] if len(w) > 5 else "")
+    if os.getpid() not in t:
+        raise Telemetry(f"ps listed {len(t)} processes, and not this one")
     return t
 
 def descendants(root, table):
@@ -61,18 +77,23 @@ def descendants(root, table):
     return seen
 
 def mac_memory():
+    """(free %, swap used MB); either is None when its query fails, exits nonzero or prints nothing usable."""
     free = swap = None
     try:
-        m = re.search(r"free percentage: (\d+)%", subprocess.run(["memory_pressure", "-Q"], capture_output=True, text=True, timeout=10).stdout)
+        r = subprocess.run(["memory_pressure", "-Q"], capture_output=True, text=True, timeout=10)
+        m = re.search(r"free percentage: (\d+)%", r.stdout) if r.returncode == 0 else None
         free = int(m.group(1)) if m else None
     except Exception:
         pass
     try:
-        m = re.search(r"used = ([\d.]+)M", subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout)
+        r = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5)
+        m = re.search(r"used = ([\d.]+)M", r.stdout) if r.returncode == 0 else None
         swap = float(m.group(1)) if m else None
     except Exception:
         pass
     return free, swap
+
+MEMORY_MISSES = 3  # an armed guard that gets no reading this many polls in a row tears the run down
 
 class Supervisor:
     def __init__(self, state):
@@ -110,11 +131,15 @@ class Supervisor:
             self.known.setdefault(pid, table[pid][2])
         return table
 
+    def child_alive(self):
+        """Our own direct child, by its Popen handle (waitpid): positive knowledge, whatever ps says."""
+        return self.proc is not None and self.proc.poll() is None  # poll() also reaps it, so it never lingers as a zombie
+
     def owned_alive(self, table=None):
-        if self.proc is not None:
-            self.proc.poll()  # reap our own direct child so it never shows as a live zombie
-        table = table or ps_table()
-        return {pid for pid, st in self.known.items() if pid in table and table[pid][2] == st}
+        child = self.child_alive()
+        table = ps_table() if table is None else table
+        alive = {pid for pid, st in self.known.items() if pid in table and table[pid][2] == st}
+        return alive | ({self.proc.pid} if child else set())
 
     def signal_owned(self, pid, sig):
         t = ps_table()
@@ -145,6 +170,11 @@ class Supervisor:
             self.note(f"send {sig.name} to recorded pids {sorted(live)}")
             for pid in live:
                 self.signal_owned(pid, sig)
+            if self.child_alive():  # recorded or not, our own child is signalled through its handle
+                try:
+                    self.proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
             t = time.monotonic()
             while time.monotonic() - t < wait and self.owned_alive():
                 time.sleep(0.2)
@@ -204,7 +234,7 @@ def supervise(sv, proc, a, cmd, stop):
         f.write(f"{proc.pid}\n")
     sv.note(f"options: " + " ".join(f"{k}={v}" for k, v in a.items() if k != "--state" and v is not None))
     sv.note(f"supervisor pid {os.getpid()} started child pid {proc.pid} pgid {pgid}: {' '.join(cmd)}")
-    t0, last_mem = time.monotonic(), 0.0
+    t0, last_mem, misses = time.monotonic(), 0.0, 0
     while proc.poll() is None and not stop["why"]:
         sv.record(proc.pid)
         if a["--max-seconds"] and time.monotonic() - t0 > float(a["--max-seconds"]):
@@ -215,6 +245,10 @@ def supervise(sv, proc, a, cmd, stop):
             last_mem = time.monotonic()
             free, swap = mac_memory()
             sv.note(f"mem free_pct={free} swap_used_mb={swap}")
+            missing = (a["--min-free-pct"] and free is None) or (a["--max-swap-mb"] and swap is None)
+            misses = misses + 1 if missing else 0
+            if misses >= MEMORY_MISSES:
+                stop["why"] = f"memory guard: no reading in {misses} polls in a row"
             if a["--min-free-pct"] and free is not None and free < int(a["--min-free-pct"]):
                 stop["why"] = f"memory guard: free {free}% < {a['--min-free-pct']}%"
             if a["--max-swap-mb"] and swap is not None and swap > float(a["--max-swap-mb"]):

@@ -7,7 +7,7 @@ In-process cases run groupwatch.run() on a real short command with Supervisor.te
 review: the command exits 0 and teardown reports False). Program cases run groupwatch.py itself and signal it, and run
 `stop` against a stand-in supervisor whose log the test writes.
 """
-import errno, os, signal, subprocess, sys, tempfile, time, unittest
+import contextlib, errno, io, os, signal, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -182,6 +182,101 @@ class InProcess(unittest.TestCase):
         rc, log = self.run_gw(["sleep", "30"], lambda *a: False, "--trigger-file", trigger)
         self.assertEqual(rc, groupwatch.UNCLEAN)
         self.assertIn("ABORT: trigger file; clean=False", log)
+
+
+REAL_RUN = subprocess.run
+
+
+def failing_ps(after=0, result=None):
+    """subprocess.run as groupwatch calls it, except that ps answers `result` (exit 1, nothing printed) from call `after`."""
+    calls = {"ps": 0}
+    def fake(argv, *a, **k):
+        if argv[0] == "ps":
+            calls["ps"] += 1
+            if calls["ps"] > after:
+                return result or subprocess.CompletedProcess(argv, 1, "", "ps failed")
+        return REAL_RUN(argv, *a, **k)
+    return fake
+
+
+class Telemetry(unittest.TestCase):
+    """A process query that fails, or answers nothing usable, must never read as "every process is gone"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = os.path.join(self.tmp.name, "gw")
+
+    def ps_answers(self, rc, out):
+        with patch.object(groupwatch.subprocess, "run", failing_ps(result=subprocess.CompletedProcess(["ps"], rc, out, "x"))):
+            return groupwatch.ps_table()
+
+    def test_ps_table_refuses_a_failed_or_unusable_answer(self):
+        mine = REAL_RUN(["ps", "-o", "pid=,ppid=,pgid=,stat=,lstart=,args=", "-p", str(os.getpid())], capture_output=True, text=True).stdout
+        self.assertIn(os.getpid(), groupwatch.ps_table())  # the real one, for contrast
+        for rc, out, why in ((1, "", "nonzero exit, nothing printed"), (1, mine, "nonzero exit, output printed"),
+                             (0, "", "exit 0, nothing printed"), (0, "garbage\n" + mine, "a line that does not parse"),
+                             (0, "1 0 1 Ss Mon Oct 26 00:00:00 2026 /sbin/launchd\n", "a table without this process")):
+            with self.assertRaises(getattr(groupwatch, "Telemetry", Exception), msg=why):  # an older groupwatch has no Telemetry
+                self.ps_answers(rc, out)
+
+    def test_memory_readings_from_a_failed_query_are_missing_not_numbers(self):
+        out = "System-wide memory free percentage: 50%\n"
+        with patch.object(groupwatch.subprocess, "run", lambda argv, *a, **k: subprocess.CompletedProcess(argv, 1, out + "used = 9.00M", "")):
+            self.assertEqual(groupwatch.mac_memory(), (None, None))
+
+    def supervisor(self):
+        os.makedirs(self.state)
+        sv = groupwatch.Supervisor(self.state)
+        self.addCleanup(close, sv)
+        sv.proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(lambda: sv.proc.poll() is None and sv.proc.kill())
+        return sv
+
+    def test_teardown_with_ps_failing_is_not_clean_and_kills_the_child(self):
+        sv = self.supervisor()
+        with patch.object(groupwatch.subprocess, "run", failing_ps()):
+            ok = groupwatch.safe_teardown(sv, sv.proc.pid, sv.proc.pid, "test")
+        self.assertIs(ok, False)
+        self.assertIsNotNone(sv.proc.poll())  # the fallback killed it through its handle
+
+    def test_teardown_never_calls_a_live_unrecorded_child_gone(self):
+        sv = self.supervisor()  # its child was never recorded (as when every record() before teardown failed)
+        with patch.object(groupwatch.Supervisor, "record", lambda sv, root: groupwatch.ps_table()):
+            ok = sv.teardown(sv.proc.pid, sv.proc.pid, "test")
+        self.assertIsNotNone(sv.proc.poll())  # signalled through its handle
+        self.assertIs(ok, True)  # clean only because its exit is known
+
+    def test_run_with_ps_failing_after_launch_fails_closed_and_stop_agrees(self):
+        with patch.object(groupwatch.subprocess, "run", failing_ps(after=1)), patch.object(groupwatch.signal, "signal"):
+            started = time.monotonic()
+            rc = groupwatch.run(["--state", self.state, "--", "sleep", "20"])
+        self.assertEqual(rc, groupwatch.UNCLEAN)
+        self.assertLess(time.monotonic() - started, 15)  # torn down at once, not left to run out
+        log = Path(self.state, "groupwatch.log").read_text()
+        self.assertIn("ps exited 1", log)
+        self.assertNotIn("clean=True", log)
+        rows = Path(self.state, "supervisor.id").read_text().splitlines()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertNotEqual(groupwatch.verdict(self.state, int(rows[0]), rows[3]), 0)
+
+    def test_an_armed_memory_guard_with_no_readings_tears_down(self):
+        with patch.object(groupwatch, "mac_memory", lambda: (None, None)), patch.object(groupwatch.signal, "signal"):
+            started = time.monotonic()
+            rc = groupwatch.run(["--state", self.state, "--min-free-pct", "10", "--", "sleep", "25"])
+        self.assertEqual(rc, 3)
+        self.assertLess(time.monotonic() - started, 22)
+        self.assertIn("ABORT: memory guard: no reading in 3 polls in a row; clean=True", Path(self.state, "groupwatch.log").read_text())
+
+    def test_stop_with_ps_failing_is_not_success(self):
+        os.makedirs(self.state)
+        Path(self.state, "supervisor.id").write_text(f"{os.getpid()}\nx\nx\nt\n")
+        with patch.object(groupwatch.subprocess, "run", failing_ps()), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                rc = groupwatch.stop(["--state", self.state])
+            except getattr(groupwatch, "Telemetry", Exception):
+                rc = "raised"
+        self.assertNotEqual(rc, 0)
 
 
 class Program(unittest.TestCase):
