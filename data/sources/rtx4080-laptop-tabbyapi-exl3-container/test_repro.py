@@ -96,10 +96,16 @@ stop() { [ -f "$S/$1/pid" ] && { kill -9 -- "-$(cat "$S/$1/pid")" 2>/dev/null; k
 case "$1" in
   image)
     case "$2" in
-      exists) [ -n "${FAKE_IMAGE_ABSENT:-}" ] && [ ! -e "$FAKE_STATE/pulled" ] && exit 1; exit 0 ;;
+      exists)
+        if [ -n "${FAKE_EXISTS_ORPHAN:-}" ]; then  # runs into the stage's own 60 s deadline: the direct child
+          (trap '' TERM; exec sleep "$FAKE_EXISTS_ORPHAN") &  # dies on TERM, a grandchild ignores it
+          exec sleep 600
+        fi
+        [ -n "${FAKE_IMAGE_ABSENT:-}" ] && [ ! -e "$FAKE_STATE/pulled" ] && exit 1; exit 0 ;;
       inspect) echo "$FAKE_DIGEST" ;;
     esac ;;
   pull)
+    [ -n "${FAKE_PULL_FAIL:-}" ] && exit 1
     if [ -n "${FAKE_PULL_HANG:-}" ]; then  # a slow pull, deaf to TERM, with a second process in its group
       trap '' TERM; sleep "$FAKE_PULL_HANG" & exec sleep "$FAKE_PULL_HANG"
     fi
@@ -410,6 +416,19 @@ class Repro(unittest.TestCase):
         self.assertEqual(left, [], "the stage or its grandchild survived")
         self.assertNotIn("run -d", self.calls()); self.assertClean()
 
+    # ---- Codex: a stage reaches its own deadline; its direct child dies on TERM, a grandchild ignores it, and
+    # `timeout` exits 124 before its -k KILL. The grandchild must not survive, and cleanup must say so truthfully.
+    def test_stage_own_deadline_grandchild_ignores_term(self):
+        import random, re
+        self.hang = str(7000000 + random.randrange(1000000))
+        rc = self.run_repro(timeout=300, FAKE_EXISTS_ORPHAN=self.hang, FAKE_PULL_FAIL="1")
+        self.assertEqual(rc, 4, self.out[-2000:])  # image check timed out, the pull failed
+        self.assertIn("outlived its timeout", self.out)
+        self.assertTrue(re.search(r"cleanup verdict: ok=1 after \d+s", self.out), self.out[-2000:])
+        left = subprocess.run(["pgrep", "-f", f"^sleep {self.hang}$"], capture_output=True, text=True).stdout.split()
+        self.assertEqual(left, [], "the grandchild survived the stage")
+        self.assertClean()
+
     # ---- Tier 2 r1 F6: [DONE] reaches the client half a second before the stream closes
     def test_late_eof_after_done(self):
         rc = self.run_repro(FAKE_FAULTS="late_eof")
@@ -558,6 +577,62 @@ class Repro(unittest.TestCase):
 
     def test_container_start_failure(self):
         self.assertEqual(self.run_repro(FAKE_RUN_FAIL="1"), 5); self.assertClean()
+
+
+class StageGroup(unittest.TestCase):
+    """The exact stage / empty_group / stop_stage functions from repro.sh, run in a bare bash harness."""
+    # an unkillable group, simulated: pgrep keeps reporting it, and kill is a no-op so the harness never signals a
+    # group id it does not own (tearDown removes the test's own sleep)
+    UNKILLABLE = 'pgrep() { return 0; }; kill() { echo "kill suppressed: $*"; }'
+    def setUp(self):
+        import random
+        self.n = str(7000000 + random.randrange(1000000))
+        s = open(os.path.join(HERE, "repro.sh")).read()
+        self.funcs = s[s.index("proc_start() {"):s.index("# A container id is this run's only")]
+
+    def tearDown(self):
+        for pid in subprocess.run(["pgrep", "-f", f"^sleep {self.n}$"], capture_output=True, text=True).stdout.split():
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+    def bash(self, body, pre=""):  # stage commands send their output to /dev/null: a survivor must not hold these pipes
+        harness = ('STAGE=; STAGE_T=\nstamp() { echo "STAMP $*"; }\nfail() { echo "FAIL $1 STAGE=[$STAGE]"; exit "$1"; }\n'
+                   + self.funcs + pre + "\n" + body)
+        return subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=60)
+
+    def left(self):
+        time.sleep(0.5)  # an orphan reparented to init is reaped promptly once it is KILLed
+        return subprocess.run(["pgrep", "-f", f"^sleep {self.n}$"], capture_output=True, text=True).stdout.split()
+
+    def test_own_deadline_grandchild_ignores_term(self):  # Codex's reproduction: stage 1 1, rc 124
+        r = self.bash(f"""stage 1 1 bash -c "exec > /dev/null 2>&1; (trap '' TERM; exec sleep {self.n}) & exec sleep 100"; echo "rc=$? STAGE=[$STAGE] STAGE_T=[$STAGE_T]"
+stop_stage; echo "cleanup_rc=$?" """)
+        self.assertIn("rc=124 STAGE=[] STAGE_T=[]", r.stdout, r.stdout + r.stderr)
+        self.assertIn("outlived its timeout", r.stdout)
+        self.assertIn("cleanup_rc=0", r.stdout)
+        self.assertEqual(self.left(), [], "the grandchild survived")
+
+    def test_finished_stage_leaves_a_child(self):
+        r = self.bash(f'stage 10 1 bash -c "exec > /dev/null 2>&1; sleep {self.n} & exit 0"; echo "rc=$? STAGE=[$STAGE]"')
+        self.assertIn("rc=0 STAGE=[]", r.stdout, r.stdout + r.stderr)
+        self.assertEqual(self.left(), [], "the background child survived")
+
+    def test_clean_stage_needs_no_kill(self):
+        r = self.bash('stage 10 1 true; echo "rc=$? STAGE=[$STAGE]"')
+        self.assertIn("rc=0 STAGE=[]", r.stdout); self.assertNotIn("outlived", r.stdout)
+
+    def test_group_that_cannot_be_emptied_fails_closed(self):  # pgrep keeps reporting the group: an unkillable member
+        r = self.bash(f'stage 1 1 bash -c "exec > /dev/null 2>&1; (trap \'\' TERM; exec sleep {self.n}) & exec sleep 100"; echo "returned rc=$?"',
+                      pre=self.UNKILLABLE)
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"FAIL 9 STAGE=\[\d+\]")  # the identity is kept for cleanup
+        self.assertNotIn("returned rc=", r.stdout)
+
+    def test_stop_stage_reports_a_group_it_cannot_empty(self):
+        r = self.bash('sleep 0.1 & STAGE=$!; STAGE_T=x; wait; stop_stage; echo "stop_rc=$?"', pre=self.UNKILLABLE)
+        self.assertIn("survived KILL", r.stdout); self.assertIn("stop_rc=1", r.stdout)
 
 
 class RecorderShutdown(unittest.TestCase):

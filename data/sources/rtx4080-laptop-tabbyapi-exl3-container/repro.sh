@@ -48,7 +48,8 @@
 # complete path, with at most two container ids (this run makes one `podman run`; a cidfile id plus a
 # label match is the most there can be):
 #   either a short foreground call finishing (parish-media 20 + 5) 25, or stopping
-#     the running stage (its -k grace, at most 30, + 5, then KILL of its group) 36    36
+#     the running stage (its -k grace, at most 30, + 5, then KILL of its group and
+#     up to 5 s for it to empty) 40                                                  40
 #   label enumeration (ps 10)                                                       15
 #   per id x 2: owner check (inspect 10) 15, log (logs 30) 35, inspect (10) 15,
 #     rm -t 10 (25) 30, absence (exists 10, ps 10) 30, kill (10) 15, rm -t 0 (20) 25,
@@ -57,7 +58,7 @@
 #   helper fence: TERM, 10 s wait, KILL                                             12
 #   GPU readback (2 x nvidia-smi 10)                                                30
 #   writes and stamps                                                                5
-#   total                                                                          503  -> CLEANUP_RESERVE=540
+#   total                                                                          507  -> CLEANUP_RESERVE=540
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -133,8 +134,25 @@ stage() {
     wait "$STAGE"; rc=$?
     [ -n "$STAGE_T" ] && [ "$(proc_start "$STAGE")" = "$STAGE_T" ] || break  # still running: the wait was interrupted
   done
+  # The stage's `timeout` has exited, but its process group can outlive it: on the stage's own deadline
+  # `timeout` exits 124 as soon as its child is gone, before its -k KILL reaches a grandchild that ignores
+  # TERM; a finished stage can also leave a background child behind. The identity stays set until the
+  # group is confirmed empty, so a failure here still leaves cleanup something to find.
+  empty_group "$STAGE" || fail 9 "stage process group $STAGE survived KILL"
   STAGE=; STAGE_T=
   return "$rc"
+}
+# KILL whatever is left in process group $1 and wait (up to 5 s) until nothing of it remains.
+empty_group() {
+  local g=$1 i
+  pgrep -g "$g" > /dev/null 2>&1 || return 0
+  stamp "stage process group $g outlived its timeout; KILLing what is left"
+  kill -KILL -- "-$g" 2>/dev/null
+  for i in $(seq 1 25); do
+    pgrep -g "$g" > /dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  return 1
 }
 # Stop the running stage: TERM its `timeout` (it passes TERM to the stage and its process group, then KILLs
 # them after its -k grace), wait up to 35 s, KILL anything left in that process group, and require it empty.
@@ -150,8 +168,7 @@ stop_stage() {
       sleep 0.2
     done
   fi
-  if pgrep -g "$pid" > /dev/null 2>&1; then kill -KILL -- "-$pid" 2>/dev/null; sleep 0.5; fi
-  if pgrep -g "$pid" > /dev/null 2>&1; then stamp "stage process group $pid survived KILL"; return 1; fi
+  empty_group "$pid" || { stamp "stage process group $pid survived KILL"; return 1; }
   wait "$pid" 2>/dev/null
   STAGE=; STAGE_T=
   return 0
