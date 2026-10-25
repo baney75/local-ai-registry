@@ -290,8 +290,7 @@ class Repro(unittest.TestCase):
         import hashlib
         out = {}
         for top in ("lab", "registry", REL):
-            for dp, dn, fn in os.walk(os.path.join(self.repo, top)):
-                dn[:] = [d for d in dn if d != "__pycache__"]
+            for dp, dn, fn in os.walk(os.path.join(self.repo, top)):  # __pycache__ included: bytecode is a write too
                 for f in fn:
                     q = os.path.join(dp, f)
                     out[os.path.relpath(q, self.repo)] = hashlib.sha256(open(q, "rb").read()).hexdigest()

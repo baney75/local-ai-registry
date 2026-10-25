@@ -302,9 +302,9 @@ flock -n 9 || fail 7 "another run holds $STORE/repro.lock"
 # 1. Inputs
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || fail 4 "Python 3.11 or newer is required"
 [ "$(sha256sum "$ROOT/lab/lab.py" | cut -d' ' -f1)" = "$LAB_SHA" ] || fail 4 "lab/lab.py is not the stock lab"
-stage 60 5 "$PYTHON" -I -c '
+stage 60 5 "$PYTHON" -I -B -c '
 import json, sys
-sys.path.insert(0, sys.argv[4] + "/lab"); import lab
+sys.path.insert(0, sys.argv[4] + "/lab"); import lab  # -B: importing from the checkout writes no __pycache__ there
 L = lab.render(json.load(open(sys.argv[1])))
 json.dump(L, open(sys.argv[2], "w"), indent=1, sort_keys=True)
 open(sys.argv[3], "w").write(L["config"]["text"])
