@@ -34,6 +34,11 @@ SHAS = ('1' * 64, '2' * 64, '3' * 64, '4' * 64)
 SERVER = 'open("SERVER_STARTED", "w").write("ok")\n'
 
 
+# Launches that adopted the pinned host runtime on purpose, each qualified afresh on it. Every other launch must not use
+# the new fields, and its pin must stay exactly what it was before them.
+RUNTIME_LAUNCHES = {'mlx-lm-unlimited-rt312-lfm2.5-2.6b-4bit-32k-m1'}
+
+
 def before(p):
     """The pin before `runtime` counted (cards and machines count only when not 1)."""
     topology = {k: p[k] for k in ('cards', 'machines') if p.get(k, 1) != 1}
@@ -248,6 +253,12 @@ CACHES = {
     'same repo twice in one cache, repo case differs': two_hub({}, {'repo': 'Org/Model', 'revision': 'd' * 40}),
     'same repo twice, the cache path differs in case': two_hub({}, {'at': 'rt/HF-cache', 'revision': 'd' * 40}),
     'same repo twice in one cache, no runtime': two_hub({}, {'revision': 'd' * 40}, runtime=False),
+    'macos is a string': edit(['runtime', 'macos'], '15'),
+    'macos is a bool': edit(['runtime', 'macos'], True),
+    'macos below 11': edit(['runtime', 'macos'], 10),
+    'macos above 99': edit(['runtime', 'macos'], 100),
+    'macos is a dotted version': edit(['runtime', 'macos'], '15.0'),
+    'macos is null': edit(['runtime', 'macos'], None),
 }
 BAD.update({f'cache: {k}': v for k, v in CACHES.items()})
 # r5: a hub launch without a runtime is confined too, so its launcher path is checked like any other
@@ -262,6 +273,7 @@ BAD_LAB = {
     'runtime on a container': lambda: {**launch(), 'kind': None},
     'ref on a container': lambda: {**launch(), 'kind': None, 'runtime': None},
     'hub weights extra key': edit(['weights', 0, 'sha256'], '1' * 64),
+    'macos is a float': edit(['runtime', 'macos'], 15.0),  # JSON 15.0 reaches JS as 15; the registry never holds one
 }
 
 
@@ -310,11 +322,26 @@ class ContractTest(unittest.TestCase):
                 sdk.steps({'model': 'test-model', 'launch': make()})
 
     def test_launches_without_the_fields_are_untouched(self):
-        # no registry profile uses the fields yet; every rendered launch still passes
+        # only the launches named in RUNTIME_LAUNCHES use the fields; every rendered launch passes
+        seen = set()
         for f in sorted(lab.RECIPES.rglob('*.json')):
-            L = lab.render(json.loads(f.read_text()))
-            self.assertNotIn('runtime', L, f.name)
+            r = json.loads(f.read_text())
+            L = lab.render(r)
             lab.check_host_runtime(L)
+            if 'runtime' not in L:
+                continue
+            launch_id = r['engine'].split('@')[0]
+            self.assertIn(launch_id, RUNTIME_LAUNCHES, f.name)
+            seen.add(launch_id)
+            # it renders as the confined runtime steps (after any "Set up first" note and its macOS check), and its one-script
+            # command stops at the first failure
+            x = {'model': r['model'], 'launch': L}
+            titles = [s['title'] for s in sdk.steps(x) if s['title'] != 'Set up first']
+            if 'macos' in L['runtime']:
+                self.assertEqual(titles.pop(0), 'Check the macOS version', f.name)
+            self.assertEqual(titles[:3], ['Install the runtime', 'Install the packages', 'Download the weights'], f.name)
+            self.assertTrue(sdk.command(x).startswith('set -e\n\n'), f.name)
+        self.assertEqual(seen, RUNTIME_LAUNCHES)
 
     def test_check_reports_a_bad_runtime(self):
         bad = profile({**runtime(), 'archive': {**runtime()['archive'], 'sha256': 'x' * 64}})
@@ -335,9 +362,14 @@ class PinTest(unittest.TestCase):
         ps = [json.loads(f.read_text()) for f in sorted(lab.LAUNCHES.glob('*.json'))]
         hosts = [p for p in ps if p.get('kind') == 'host']
         self.assertTrue(hosts)
-        self.assertFalse([p['id'] for p in ps if 'runtime' in p])
+        self.assertEqual({p['id'] for p in ps if 'runtime' in p}, RUNTIME_LAUNCHES)
         for p in hosts:
-            self.assertEqual(lab.pin(p), before(p), p.get('id'))
+            if p['id'] in RUNTIME_LAUNCHES:  # its runtime is part of what runs, so it is in the pin, and it is all that moved it
+                self.assertNotEqual(lab.pin(p), before(p), p['id'])
+                rest = {k: v for k, v in p.items() if k != 'runtime'}
+                self.assertEqual(lab.pin(rest), before(rest), p['id'])
+            else:
+                self.assertEqual(lab.pin(p), before(p), p.get('id'))
 
     def test_runtime_counts(self):
         p = profile()
@@ -386,6 +418,17 @@ class StepsTest(unittest.TestCase):
             self.assertIn(flag, code)
         self.assertLess(code.index('shasum -a 256 -c SHA256SUMS'), code.index('pip --isolated install'))
         self.assertLess(code.index('pip --isolated install'), code.index('mv "$s/t" rt/site'))
+
+    def test_macos_check_comes_first_and_only_when_asked(self):
+        L = launch({**runtime(), 'macos': 15})
+        for name, st in renderings(L).items():
+            self.assertEqual([s['title'] for s in st][:2], ['Check the macOS version', 'Install the runtime'], name)
+            code = st[0]['code']
+            self.assertTrue(code.startswith('(\nset -e\n') and code.endswith('\n)'), name)
+            self.assertIn('sw_vers -productVersion', code)
+            self.assertIn('-lt 15 ]', code)
+            self.assertNotIn('curl', code)
+        self.assertNotIn('Check the macOS version', [s['title'] for s in self.steps])
 
     def test_existing_shapes_unchanged(self):
         # without the new fields: the old install, pip, --local-dir and launcher rendering, and no `set -e` in command()
@@ -615,6 +658,25 @@ class SandboxTest(unittest.TestCase):
                         self.assertFalse((w / a).exists(), (case, name, shell, a))
                     self.assertFalse((w / 'SERVER_STARTED').exists(), (case, name, shell))
                     self.assertEqual(staging_left(w), [], (case, name, shell))
+
+    def test_macos_check_stops_before_any_download(self):
+        L = launch({**runtime(self.shas), 'macos': 15})
+        for version, passes in (('14.6', False), ('11.7.10', False), ('not a version', False), (None, False), ('15.0', True), ('26.4.1', True)):
+            (self.bin / 'sw_vers').write_text('#!/bin/sh\nexit 1\n' if version is None else f"#!/bin/sh\necho '{version}'\n")
+            (self.bin / 'sw_vers').chmod(0o755)
+            for name, script in renderings(L, 'command').items():
+                for shell in SHELLS:
+                    w = self.work()
+                    r = self.sh(script, w, shell)
+                    if passes:
+                        self.assertEqual(r.returncode, 0, (version, name, shell, r.stderr[-2000:]))
+                        self.assertEqual((w / 'SERVER_STARTED').read_text(), 'ok')
+                    else:
+                        self.assertNotEqual(r.returncode, 0, (version, name, shell))
+                        self.assertIn('needs macOS 15 or later', r.stderr, (version, name, shell))
+                        self.assertEqual(sorted(p.name for p in w.iterdir()), ['python3'], (version, name, shell))  # nothing made
+                    self.assertNothingRan(w)
+        (self.bin / 'sw_vers').unlink()
 
     # 2. packages: a fresh staged target, published only after the whole install succeeded
 

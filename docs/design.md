@@ -82,6 +82,9 @@ Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is r
   staging and backup directories in place, never deletes them. Other files in
   `into` (packages, weights, the launcher) are kept.
 - `python`: the interpreter, a relative path inside `into`, run as `./<python>`, never looked up on `PATH`.
+- `macos`: the lowest macOS major version the runtime runs on (an integer, 11 to 99). It renders as the first step,
+  "Check the macOS version", which reads `sw_vers -productVersion` and stops, before anything is downloaded, on an older
+  macOS or where the version cannot be read.
 - `packages: {dir, target, wheels: [{name, version, url, sha256}]}` (needs `python`; `dir` and `target` do not overlap):
   every wheel is downloaded into a fresh directory beside `dir` and checked against its hash, then installed offline into a
   fresh directory beside `target` with

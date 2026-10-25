@@ -25,6 +25,7 @@ import shlex
 import string
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -278,6 +279,9 @@ def count(endpoint, text):
         try:
             out, _ = call(endpoint, path, body, timeout=120)
             n = int(out.get("length") or out.get("count") or len(out.get("tokens") or []))
+        except urllib.error.HTTPError as e:  # no such route: close the error's response, then try the next one
+            e.close()
+            continue
         except Exception:
             continue
         if n or not text:  # no tokens for a non-empty text is a request the server did not understand
@@ -298,8 +302,12 @@ def chat(endpoint, model, messages, **kw):
     return c, u, secs
 
 
-def stream_rate(endpoint, model, prompt, window=30.0):
-    """Tokens per second over the first `window` seconds after the first token, from a streamed answer."""
+ESTIMATED_TPS = "tps counts tokens as characters/4 (an estimate): the server has no tokenize route"
+
+
+def stream_rate(endpoint, model, prompt, window=30.0, modes=None):
+    """Tokens per second over the first `window` seconds after the first token, from a streamed answer. If `modes` is a
+    list, how the window and the whole answer were counted ("tokenizer" or "estimate", from count()) is appended to it."""
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.8, "stream": True}
     headers = {"Content-Type": "application/json"}
     if os.environ.get("LAB_API_KEY"):
@@ -326,8 +334,10 @@ def stream_rate(endpoint, model, prompt, window=30.0):
     whole = "".join(text)
     elapsed = time.monotonic() - (first or t0)
     sample, span = at_window or (whole, elapsed)
-    n, _ = count(endpoint, sample)
-    total, _ = count(endpoint, whole)
+    n, how = count(endpoint, sample)
+    total, how_total = count(endpoint, whole)
+    if modes is not None:
+        modes += [how, how_total]
     return (n / span if span else 0), total, time.monotonic() - t0
 
 
@@ -399,13 +409,17 @@ def gates(endpoint, launch):
         ev["context"]["peak_gib"] = round(u["peak_memory_gb"] * 1e9 / 2**30, 2)
     # speed: decode at concurrency 1, measured over the first 30 s of a streamed answer; the answer still runs
     # to its natural end (never capped), and its full length is kept as evidence
-    tps, total, secs = stream_rate(endpoint, served, "Write a detailed 600-word story about a lighthouse keeper.")
+    modes = []
+    tps, total, secs = stream_rate(endpoint, served, "Write a detailed 600-word story about a lighthouse keeper.", modes=modes)
     ok["speed"] = tps >= MIN_TPS
-    ev["speed"] = {"window_s": 30, "tokens_total": total, "seconds_total": round(secs, 1)}
+    ev["speed"] = {"window_s": 30, "tokens_total": total, "seconds_total": round(secs, 1), "counted": modes[0]}
     # a retried answer comes from the server's prefix cache, so its seconds is not a prefill time: leave the
     # number out rather than publish a cached rate (the run can be repeated for a real prefill measurement)
     prefill = None if dropped else (round(got / ev["context"]["seconds"]) if got and ev["context"]["seconds"] else None)
     proof = {"gates": " ".join(g for g in GATES if ok.get(g)), "tps": round(tps, 1), "prefill": prefill, "served": served}
+    if modes[0] == "estimate":  # say so wherever the proof is shown, not only in the run's evidence
+        proof["tps_estimated"] = True  # the typed flag the catalog and the site read
+        proof["note"] = ESTIMATED_TPS
     return all(ok.get(g) for g in GATES), proof, {"ok": ok, **ev}
 
 
@@ -687,7 +701,9 @@ def check_host_runtime(launch):
             check_host_paths(launch)
         return
     assert kind == "host", "runtime is for host launches"
-    assert isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages"}, f"runtime keys {sorted(rt) if isinstance(rt, dict) else rt}"
+    assert isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages", "macos"}, f"runtime keys {sorted(rt) if isinstance(rt, dict) else rt}"
+    if "macos" in rt:  # the lowest macOS major version: the steps stop before any download on an older one
+        assert type(rt["macos"]) is int and 11 <= rt["macos"] <= 99, f"runtime.macos {rt.get('macos')!r} is a major version, 11 to 99"
     assert not launch.get("pip"), "runtime and pip are exclusive (pip installs globally)"
     if "archive" in rt:
         a = rt["archive"]
@@ -799,6 +815,8 @@ def cmd_check(_):
                     assert p.get("launch_sha256") == launch_hash(launch), "typed launch changed since acceptance; rerun the recipe"
             if "withdrawn" in p:
                 assert p["withdrawn"] is True and p.get("src") and p.get("reason"), "withdrawal needs source and reason"
+            for q in r["proof"]:  # an estimated decode speed says so in a typed flag, and only as True
+                assert q.get("tps_estimated", True) is True, "proof.tps_estimated is true or absent"
             need = set() if p.get("reported") or p.get("withdrawn") else {"load", "chat"} if p.get("legacy") else set(GATES)
             assert not r["proof"][0].get("reported") or r["proof"][0].get("src"), "a reported proof names its source"
             assert need <= set(r["proof"][0]["gates"].split()), "latest proof lacks a gate"

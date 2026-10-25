@@ -10,6 +10,8 @@ export type Weights = { repo: string; revision: string; at: string; layout?: str
 export type Runtime = {
   archive?: { url: string; sha256: string; into: string };
   python?: string;
+  /** The lowest macOS major version (11 to 99): the first step stops on an older macOS, before any download. */
+  macos?: number;
   packages?: { dir: string; target: string; wheels: { name: string; version: string; url: string; sha256: string }[] };
 };
 export type Proof = { at: string; on: string; gpu?: string | null; gates: string; tps: number | null; prefill?: number | null; proxy?: string; legacy?: boolean };

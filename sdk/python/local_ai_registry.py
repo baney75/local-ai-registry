@@ -123,7 +123,9 @@ def _check_host(l):
     rt = l.get("runtime")
     if rt is None:
         return _check_paths(l)
-    _ok(isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages"} and not l.get("pip"), "runtime keys")
+    _ok(isinstance(rt, dict) and rt and set(rt) <= {"archive", "python", "packages", "macos"} and not l.get("pip"), "runtime keys")
+    if "macos" in rt:  # the lowest macOS major version the runtime runs on, checked before any download
+        _ok(type(rt["macos"]) is int and 11 <= rt["macos"] <= 99, f"runtime.macos {rt.get('macos')!r}")
     if "archive" in rt:
         a = rt["archive"]
         _ok(isinstance(a, dict) and set(a) == {"url", "sha256", "into"}, "runtime.archive keys")
@@ -231,11 +233,22 @@ def _strict(lines):
     return "(\nset -e\n" + "\n".join(lines) + "\n)"
 
 
+# runtime.macos: stop before anything is downloaded on an older macOS, or where the version cannot be read. The same text
+# in both SDKs (MACOS is the version).
+_MACOS = [
+    'v=$(sw_vers -productVersion 2>/dev/null) || v=',
+    'case "${v%%.*}" in \'\'|*[!0-9]*) echo "local-ai: this runtime needs macOS MACOS or later; could not read the macOS version" >&2; exit 1;; esac',
+    'if [ "${v%%.*}" -lt MACOS ]; then echo "local-ai: this runtime needs macOS MACOS or later; this Mac runs macOS $v" >&2; exit 1; fi',
+]
+
+
 def _runtime_steps(l):
     """The pinned interpreter archive, then the hash-locked offline wheel install. Each is staged in a fresh directory
     beside its destination and checked in full (hashes, entry names, links, the interpreter) before anything live is
     touched; it is then published by rename, and a failed rename puts back everything it had moved."""
     rt, out = l["runtime"], []
+    if "macos" in rt:
+        out.append({"title": "Check the macOS version", "code": _strict([x.replace("MACOS", str(rt["macos"])) for x in _MACOS])})
     if "archive" in rt:
         a, into = rt["archive"], rt["archive"]["into"]
         f, d = _url_file(a["url"]), _q(into)

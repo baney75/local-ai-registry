@@ -82,7 +82,8 @@ function checkHost(l) {
   if (l.config && confined(l)) ok(is(RT.rel, l.config.at), "launcher path");  // a launcher the setup steps write: a plain relative path
   const rt = l.runtime;
   if (rt === undefined || rt === null) return checkPaths(l);
-  ok(keys(rt) && Object.keys(rt).length && Object.keys(rt).every((k) => ["archive", "python", "packages"].includes(k)) && !l.pip?.length, "runtime keys");
+  ok(keys(rt) && Object.keys(rt).length && Object.keys(rt).every((k) => ["archive", "python", "packages", "macos"].includes(k)) && !l.pip?.length, "runtime keys");
+  if ("macos" in rt) ok(Number.isInteger(rt.macos) && rt.macos >= 11 && rt.macos <= 99, `runtime.macos ${JSON.stringify(rt.macos)}`);  // checked before any download
   if ("archive" in rt) {
     const a = rt.archive;
     ok(keys(a) === "into,sha256,url", "runtime.archive keys");
@@ -159,11 +160,19 @@ const parent = (path) => (path.includes("/") ? path.replace(/\/[^/]*$/, "") : ".
 /** One step as one subshell that stops at its first failure and returns non-zero (pasted alone or in a script). */
 const strict = (lines) => `(\nset -e\n${lines.join("\n")}\n)`;
 
+// runtime.macos: stop before anything is downloaded on an older macOS, or where the version cannot be read. The same text
+// in both SDKs (MACOS is the version).
+const MACOS = [
+  "v=$(sw_vers -productVersion 2>/dev/null) || v=",
+  "case \"${v%%.*}\" in ''|*[!0-9]*) echo \"local-ai: this runtime needs macOS MACOS or later; could not read the macOS version\" >&2; exit 1;; esac",
+  "if [ \"${v%%.*}\" -lt MACOS ]; then echo \"local-ai: this runtime needs macOS MACOS or later; this Mac runs macOS $v\" >&2; exit 1; fi",
+];
 /** The pinned interpreter archive, then the hash-locked offline wheel install. Each is staged in a fresh directory
  *  beside its destination and checked in full (hashes, entry names, links, the interpreter) before anything live is
  *  touched; it is then published by rename, and a failed rename puts back everything it had moved. */
 function runtimeSteps(l) {
   const rt = l.runtime, out = [];
+  if ("macos" in rt) out.push({ title: "Check the macOS version", code: strict(MACOS.map((x) => x.replaceAll("MACOS", String(rt.macos)))) });
   if (rt.archive) {
     const a = rt.archive, into = a.into, f = urlFile(a.url), d = q(into);
     const keep = owned(l).map(([, x]) => x).filter((x) => x.toLowerCase().startsWith(`${into.toLowerCase()}/`));  // ignoring case, as macOS does
