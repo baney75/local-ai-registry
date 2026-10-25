@@ -97,4 +97,35 @@ Evidence, all byte for byte from the run:
 - [raw-recorder.tar.gz](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.raw-recorder.tar.gz): 44 body files (every request and response, including both full SSE streams), `recorder.jsonl` and `SHA256SUMS`. Archive SHA256 c2c8823c3198ab6856b5c75729dc9cc5b36e2623701fc86e119b4924fbeafa52 ([.sha256](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.raw-recorder.tar.gz.sha256)).
 - The quiet baseline and run metrics came from task watchers, not from `repro.sh` or the kit: [memwatch-native.csv](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.memwatch-native.csv) (1 s samples) and [vmstat.txt](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.vmstat.txt), started 60 s before `repro.sh` by a wrapper whose log is [confirm.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-confirm.confirm.log).
 
-Limits: one confirmation run on one laptop card, through the manual device mapping described above (no NVIDIA Container Toolkit). The kit panel and full kit sweep were not run.
+The run above used `repro.sh` at 1cdb92c4. After review the controller was revised: stages are owned and stopped on the deadline, the lab runs in a scratch copy, the recorder shuts down gracefully, and no bytecode lands in the checkout. That revised controller is the one in this directory.
+
+## Confirmation run of the revised repro.sh on the card
+
+On 2026-10-25 at 07:10 UTC the published command ran once more, unchanged, from a clean export of commit f1a5fa7380ea288807f1ae80a08add2e3f655ff0 (`repro.sh` SHA256 22eaf76f8143fc64da0580698f0118085a72afbfa0077fbe1b6b7e9a44173641). The weights, image, launch and lab pins were the same. parish-media reported the GPU ready immediately before (no compute process, 52 MiB, AC on), and `repro.sh`'s own idle, AC and parish-media checks passed. It exited 0.
+
+| Measurement | Result |
+| --- | --- |
+| Six lab gates | all pass |
+| Lab speed gate | 97.0 tokens/second; 2,624 tokens in 27.2 s, natural `stop` |
+| Uncapped repeat of the stock speed request | 75.0 tokens/second; 1,891 tokens in 25.4 s, natural `stop` |
+| Context recall | 106,242 input tokens; correct code; 71.8 seconds |
+| Lab-reported prefill | 1,480 tokens/second |
+| Chat completions | exactly 7; HTTP 200; no `max_tokens`, `max_completion_tokens`, `stop` or `seed`; four JSON answers end with `stop`, the tool call with `tool_calls` (`get_weather`, Paris), both streams with `stop` and `[DONE]`; every recorder line parses |
+| Peak GPU memory | 7,862 MiB of 12,282 MiB (52 MiB in the quiet baseline) |
+| Host MemAvailable low point / swap | 17.69 GB (23.31–25.35 GB at baseline) / 4.36–4.87 GB |
+| Host CPU (vmstat us+sy), baseline vs run | mean 18.1 % (max 96 %) vs 43.2 % (max 100 %) |
+| Checkout | all 10,472 exported files byte-identical before and after; no `__pycache__` |
+| Cleanup | server log saved (78 lines), container removed and confirmed gone, helper gone, verdict after 5 s of the 540 s reserve |
+
+The host was busier on CPU during this run than during the earlier ones (mean 4 % and 8 %). Some other host load ran alongside it; the GPU itself was idle at the baseline. That probably explains the slower repeat. Both speed measurements stayed far above the 15 tokens/second floor.
+
+The recipe keeps its two committed proofs. The stock lab would put this run's proof on top, but three proofs make the recipe 1,122 bytes, and `lab/lab.py check` rejects any recipe over 1,024 bytes. The lab's own output is kept as evidence instead.
+
+Evidence, all byte for byte from the run:
+- [run JSON](../../lab-runs/rtx-4080-laptop-12gb.qwen3.5-9b.tabbyapi-qwen3.5-9b-exl3-4bpw-128k.128k.20261025T071310.json): SHA256 37229727cce45126c1ece3641a3575c9693d86d61406a79107debf32b1863b4f, log hash sha256:b1d2cbd5729c5504.
+- The [recipe the stock lab wrote](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.stock-recipe.json), in the scratch copy.
+- [repro.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.repro.log), [server.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.server.log), [postconditions.json](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.postconditions.json), [speed-repeat.json](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.speed-repeat.json) and the [checkout check](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.checkout-untouched.txt).
+- [raw-recorder.tar.gz](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.raw-recorder.tar.gz): 44 body files, `recorder.jsonl` and `SHA256SUMS`. Archive SHA256 e4c1b4388e9feb352b804e97b84822ee2332ff24c7f543394768d8a03c4edcc0 ([.sha256](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.raw-recorder.tar.gz.sha256)).
+- Task-watcher metrics, not from `repro.sh` or the kit: [memwatch-native.csv](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.memwatch-native.csv), [vmstat.txt](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.vmstat.txt) and the wrapper's [confirm.log](../../lab-runs/20261025-rtx-4080-laptop-12gb.repro-f1a5fa73.confirm.log).
+
+Limits: three runs on one laptop card (one through the task runner, two through `repro.sh`), all through the manual device mapping described above (no NVIDIA Container Toolkit). The kit panel and full kit sweep were not run. The recipe is in the registry only; see the top of this file.
