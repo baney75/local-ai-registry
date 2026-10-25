@@ -14,7 +14,13 @@ export type Runtime = {
   macos?: number;
   packages?: { dir: string; target: string; wheels: { name: string; version: string; url: string; sha256: string }[] };
 };
-export type Proof = { at: string; on: string; gpu?: string | null; gates: string; tps: number | null; prefill?: number | null; proxy?: string; legacy?: boolean };
+export type Proof = {
+  at: string; on: string; gpu?: string | null; gates: string; tps: number | null; prefill?: number | null; proxy?: string; legacy?: boolean;
+  /** Free text the lab or a publisher attached to the proof. */
+  note?: string;
+  /** Present (always true) when the lab could only estimate tps (characters/4: the server had no tokenize route). */
+  tps_estimated?: true;
+};
 export type Recipe = { key?: string; model: string; weights: string; engine: string; card: string; proof: Proof[]; launch: Launch };
 export type Card = { name: string; vendor: string; backend: string; vram_gb: number; bandwidth_gb_s: number | null; picks: string[] };
 export type Catalog = { schema: string; cards: Record<string, Card>; recipes: Record<string, Recipe>; models: Record<string, unknown> };

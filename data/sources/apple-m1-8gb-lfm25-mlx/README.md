@@ -174,9 +174,9 @@ Then run `bash tools/macmini-run3.sh setup|start|lab|probe|stop TAG`, and for th
 
 This run's task directory was built that way from `git archive` of the interim commit `91d36083` and checked against its manifest
 (10,494 files) on the target. Against this commit, file by file:
-- **byte-identical (10,474 files)**, among them everything that ran or rendered the run: `lab/lab.py`, `sdk/js/index.js`,
+- **byte-identical (10,471 files)**, among them everything that ran or rendered the run: `lab/lab.py`, `sdk/js/index.js`,
   `sdk/python/local_ai_registry.py`, the launch and launcher in `registry/launches/`, the patch, the regression harness
-  (`runtime/test_unlimited_max_tokens.py`, `run_regression_cpu.py`), and the tools `observer.py`, `groupwatch.py`, `memwatch_native.py`,
+  (`runtime/test_unlimited_max_tokens.py`, `run_regression_cpu.py`), and the tools `observer.py`, `memwatch_native.py`,
   `probe_m1.py`, `seedprobe.py`, `pristine_sampler.py` and `check_run.py`;
 - **generated for the run (4)**: `sdk-command.sh`, `sdk-setup.sh`, `sdk-start.argv`, `SOURCE_COMMIT`;
 - **replaced during the run**: `tools/macmini-run3.sh` (it gained the `long` phase) and `tools/long_answer.py` (new) were copied in after
@@ -185,7 +185,13 @@ This run's task directory was built that way from `git archive` of the interim c
 - **changed after the run**: `runtime/regression-cpu.txt` (now this run's output); `tools/audit_capture.py` and
   `tools/count_stream_tokens.py` (they now report an unanswered or cut-off connection instead of crashing; the committed analysis files were
   made with these versions); `tools/test_capture_tools.py` and `tools/test_runner.py` (a test for that, and files closed); `dist/catalog.json`
-  (this recipe added); this README; and two `__pycache__` files the SDK generation step left in the task directory (never tracked).
+  (this recipe added); this README; and two `__pycache__` files the SDK generation step left in the task directory (never tracked);
+- **changed after review**: `tools/groupwatch.py`, the run's supervisor, now fails closed. `run` exits 4 when a teardown is not clean (a
+  failing command keeps its own code), and 5 when supervision fails after the command started (it still tears down what it owns, and kills its
+  own direct child if even that cannot run). `stop` exits 0 only on that supervisor's own clean final line
+  ([`tools/test_groupwatch.py`](tools/test_groupwatch.py)). The run's provenance is unchanged: all 17 supervisors of q3 and q3b ended with an
+  `EXIT` or `ABORT` line saying `clean=True` and none hit a supervision error, so the fixed version gives every one of them the exit code the
+  run recorded. `sdk/js/index.d.ts` gained the types `Proof.note` and `Proof.tps_estimated` (declarations only; nothing rendered changes).
 
 The kit's Qwen-specific reference panel and its generic sweep were not run, and no kit result is claimed.
 
