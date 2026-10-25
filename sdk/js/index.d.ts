@@ -18,8 +18,9 @@ export type Proof = {
   at: string; on: string; gpu?: string | null; gates: string; tps: number | null; prefill?: number | null; proxy?: string; legacy?: boolean;
   /** Free text the lab or a publisher attached to the proof. */
   note?: string;
-  /** Present (always true) when the lab could only estimate tps (characters/4: the server had no tokenize route). */
-  tps_estimated?: true;
+  /** true when the lab could only estimate tps (characters/4: the server had no tokenize route); the catalog writes only
+   *  true, never false. Typed boolean so a consumer's own boolean proof type (the site's) stays assignable. */
+  tps_estimated?: boolean;
 };
 export type Recipe = { key?: string; model: string; weights: string; engine: string; card: string; proof: Proof[]; launch: Launch };
 export type Card = { name: string; vendor: string; backend: string; vram_gb: number; bandwidth_gb_s: number | null; picks: string[] };
