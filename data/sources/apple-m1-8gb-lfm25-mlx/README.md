@@ -188,10 +188,14 @@ This run's task directory was built that way from `git archive` of the interim c
   (this recipe added); this README; and two `__pycache__` files the SDK generation step left in the task directory (never tracked);
 - **changed after review**: `tools/groupwatch.py`, the run's supervisor, now fails closed. `run` exits 4 when a teardown is not clean (a
   failing command keeps its own code), and 5 when supervision fails after the command started (it still tears down what it owns, and kills its
-  own direct child if even that cannot run). `stop` exits 0 only on that supervisor's own clean final line
+  own direct child if even that cannot run). Its logging is best effort, so a full disk can no longer stop a teardown or its fallback, and an
+  unwritable log turns an exit of 0 into 5. The signal handlers are installed before the command starts. One supervisor holds a state
+  directory at a time (an exclusive lock; a second is refused before it starts anything), and each run's token heads its log lines and its
+  `supervisor.id`, so `stop` exits 0 only on that run's own clean final line and never on another run's
   ([`tools/test_groupwatch.py`](tools/test_groupwatch.py)). The run's provenance is unchanged: all 17 supervisors of q3 and q3b ended with an
-  `EXIT` or `ABORT` line saying `clean=True` and none hit a supervision error, so the fixed version gives every one of them the exit code the
-  run recorded. `sdk/js/index.d.ts` gained the types `Proof.note` and `Proof.tps_estimated` (declarations only; nothing rendered changes).
+  `EXIT` or `ABORT` line saying `clean=True`, none hit a supervision or logging error, and none shared a state directory with another (one
+  `gw-*` directory per phase and run), so the fixed version gives every one of them the exit code the run recorded. Their logs, and
+  `tools/groupwatch-options-test.txt`, predate the token prefix on log lines. `sdk/js/index.d.ts` gained the types `Proof.note` and `Proof.tps_estimated` (declarations only; nothing rendered changes).
 
 The kit's Qwen-specific reference panel and its generic sweep were not run, and no kit result is claimed.
 

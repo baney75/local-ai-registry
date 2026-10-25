@@ -18,13 +18,19 @@ Then verify that no recorded identity survives. Zombies count as dead; the super
 Log: DIR/groupwatch.log. Exit of `run`: CMD's exit code, or 3 when the guard, trigger, cap or a stop tore it down; a
 teardown that leaves a recorded process alive, or fails, exits 4 instead (CMD's own nonzero code is kept). If the
 supervision itself fails after CMD started (ps timing out, any other error), it tears down what it owns and exits 5, or
-4 if that teardown is not clean; if even teardown cannot run, it still kills its own direct child. Exit of `stop`: 0
-only when that supervisor's own final log line, after its start line, says clean=True and no FAIL line follows it.
+4 if that teardown is not clean; if even teardown cannot run, it still kills its own direct child. Logging is best
+effort: a log line that cannot be written (a full disk) never stops supervision, teardown or the fallback, and it turns
+an exit that would have been 0 into 5. The signal handlers are installed before CMD starts.
+One supervisor per state directory: `run` holds an exclusive lock on DIR/groupwatch.lock from before CMD starts until it
+returns, and refuses (exit 1, nothing started) while another holds it. Each run has its own token (its pid and random
+hex), kept in supervisor.id and at the head of every log line it writes, so lines of runs that shared DIR stay apart.
+Exit of `stop`: 0 only when that supervisor's own final EXIT/ABORT line (its token) says clean=True and no FAIL line of
+its own follows it; a supervisor.id without a token cannot be bound and is not success.
 """
-import os, re, signal, subprocess, sys, time
+import fcntl, os, re, secrets, signal, subprocess, sys, time
 
 UNCLEAN = 4  # exit code when teardown left a recorded process alive or failed
-MONITOR_FAILED = 5  # exit code when supervision failed after the command started and the teardown was clean
+MONITOR_FAILED = 5  # exit code when supervision failed after the command started (or its log could not be written)
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -71,10 +77,32 @@ def mac_memory():
 class Supervisor:
     def __init__(self, state):
         self.state, self.known, self.proc = state, {}, None  # known: pid -> lstart
+        self.log_failed = False  # a log line could not be written
+        self.lock = open(os.path.join(state, "groupwatch.lock"), "a")
+        try:  # released by close(), or by the OS when this process ends however it ends
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.lock.close()
+            raise SystemExit(f"groupwatch run: {state} is in use by another supervisor; nothing started")
+        self.token = f"{os.getpid()}-{secrets.token_hex(8)}"  # this run, distinct from any other that used DIR
         self.log = open(os.path.join(state, "groupwatch.log"), "a", buffering=1)
 
+    def close(self):
+        for f in (self.log, self.lock):
+            try:
+                f.close()
+            except Exception:
+                pass
+
     def say(self, msg):
-        self.log.write(f"{now()} {msg}\n")
+        self.log.write(f"{now()} [{self.token}] {msg}\n")
+
+    def note(self, msg):
+        """say(), best effort: a failed write is remembered, never raised, so no cleanup step waits on the log."""
+        try:
+            self.say(msg)
+        except Exception:
+            self.log_failed = True
 
     def record(self, root):
         table = ps_table()
@@ -98,7 +126,7 @@ class Supervisor:
 
     def teardown(self, root, pgid, reason):
         self.record(root)
-        self.say(f"TEARDOWN ({reason}): pgid {pgid}, recorded {sorted(self.known)}")
+        self.note(f"TEARDOWN ({reason}): pgid {pgid}, recorded {sorted(self.known)}")
         for sig, wait in ((signal.SIGTERM, 15), (signal.SIGKILL, 5)):
             table = ps_table()
             live = self.owned_alive(table)
@@ -107,21 +135,21 @@ class Supervisor:
             members = {pid for pid, v in table.items() if v[1] == pgid}
             foreign = {pid for pid in members if self.known.get(pid) != table[pid][2]}
             if members and not foreign:
-                self.say(f"send {sig.name} to group {pgid} (members {sorted(members)}, all recorded)")
+                self.note(f"send {sig.name} to group {pgid} (members {sorted(members)}, all recorded)")
                 try:
                     os.killpg(pgid, sig)
                 except ProcessLookupError:
                     pass
             elif foreign:
-                self.say(f"skip killpg {pgid}: unrecorded members {sorted(foreign)}")
-            self.say(f"send {sig.name} to recorded pids {sorted(live)}")
+                self.note(f"skip killpg {pgid}: unrecorded members {sorted(foreign)}")
+            self.note(f"send {sig.name} to recorded pids {sorted(live)}")
             for pid in live:
                 self.signal_owned(pid, sig)
             t = time.monotonic()
             while time.monotonic() - t < wait and self.owned_alive():
                 time.sleep(0.2)
         left = self.owned_alive()
-        self.say(f"after teardown alive: {sorted(left) if left else 'none'}")
+        self.note(f"after teardown alive: {sorted(left) if left else 'none'}")
         return not left
 
 def run(argv):
@@ -138,34 +166,44 @@ def run(argv):
     if not state or not cmd:
         sys.exit("groupwatch run: --state DIR and a command are required")
     os.makedirs(state, exist_ok=True)
-    sv = Supervisor(state)
+    sv = Supervisor(state)  # takes the state directory's lock, or exits before anything starts
+    try:
+        return run_locked(sv, a, cmd)
+    finally:
+        sv.close()
+
+def run_locked(sv, a, cmd):
+    state = a["--state"]
     me = ps_table()[os.getpid()]
     with open(os.path.join(state, "supervisor.id"), "w") as f:
-        f.write(f"{os.getpid()}\n{me[2]}\n{me[3]}\n")
-    proc = subprocess.Popen(cmd, start_new_session=True)
+        f.write(f"{os.getpid()}\n{me[2]}\n{me[3]}\n{sv.token}\n")
+    stop = {"why": ""}  # handlers first: a stop that arrives while CMD starts is a stop, not a dead supervisor
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, lambda n, f: stop.update(why=f"supervisor got {signal.Signals(n).name}"))
+    proc = subprocess.Popen(cmd, start_new_session=True)  # the exec'd command gets default handlers back
     sv.proc = proc
     pgid = proc.pid  # a new session: the child leads its own group
     try:  # from here on, any failure of the supervision still tears down what it started
-        return supervise(sv, proc, a, cmd)
-    except Exception as e:
-        sv.say(f"monitor failed: {type(e).__name__}: {e}")
-        ok = safe_teardown(sv, proc.pid, pgid, f"monitor failed ({type(e).__name__})")
-        sv.say(f"ABORT: monitor failed ({type(e).__name__}); clean={ok}")
+        rc = supervise(sv, proc, a, cmd, stop)
+    except BaseException as e:  # BaseException too: nothing may leave run() with the command left running
+        ok = safe_teardown(sv, proc.pid, pgid, f"monitor failed ({type(e).__name__})")  # cleanup first, then the log
+        sv.note(f"monitor failed: {type(e).__name__}: {e}")
+        sv.note(f"ABORT: monitor failed ({type(e).__name__}); clean={ok}")
         if not ok:
             return unclean(sv, MONITOR_FAILED)
-        sv.say(f"FAIL: supervision failed; exit {MONITOR_FAILED}")
+        sv.note(f"FAIL: supervision failed; exit {MONITOR_FAILED}")
         return MONITOR_FAILED
+    if rc == 0 and sv.log_failed:  # the run cannot vouch for itself without its log
+        return MONITOR_FAILED
+    return rc
 
-def supervise(sv, proc, a, cmd):
+def supervise(sv, proc, a, cmd, stop):
     state = a["--state"]
     pgid = os.getpgid(proc.pid)
     with open(os.path.join(state, "child.pid"), "w") as f:
         f.write(f"{proc.pid}\n")
-    sv.say(f"options: " + " ".join(f"{k}={v}" for k, v in a.items() if k != "--state" and v is not None))
-    sv.say(f"supervisor pid {os.getpid()} started child pid {proc.pid} pgid {pgid}: {' '.join(cmd)}")
-    stop = {"why": ""}
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(s, lambda n, f: stop.update(why=f"supervisor got {signal.Signals(n).name}"))
+    sv.note(f"options: " + " ".join(f"{k}={v}" for k, v in a.items() if k != "--state" and v is not None))
+    sv.note(f"supervisor pid {os.getpid()} started child pid {proc.pid} pgid {pgid}: {' '.join(cmd)}")
     t0, last_mem = time.monotonic(), 0.0
     while proc.poll() is None and not stop["why"]:
         sv.record(proc.pid)
@@ -176,7 +214,7 @@ def supervise(sv, proc, a, cmd):
         if (a["--min-free-pct"] or a["--max-swap-mb"]) and time.monotonic() - last_mem >= 5:
             last_mem = time.monotonic()
             free, swap = mac_memory()
-            sv.say(f"mem free_pct={free} swap_used_mb={swap}")
+            sv.note(f"mem free_pct={free} swap_used_mb={swap}")
             if a["--min-free-pct"] and free is not None and free < int(a["--min-free-pct"]):
                 stop["why"] = f"memory guard: free {free}% < {a['--min-free-pct']}%"
             if a["--max-swap-mb"] and swap is not None and swap > float(a["--max-swap-mb"]):
@@ -184,11 +222,11 @@ def supervise(sv, proc, a, cmd):
         time.sleep(1)
     if stop["why"]:
         ok = safe_teardown(sv, proc.pid, pgid, stop["why"])
-        sv.say(f"ABORT: {stop['why']}; clean={ok}")
+        sv.note(f"ABORT: {stop['why']}; clean={ok}")
         return 3 if ok else unclean(sv, 3)
     rc = proc.wait()
     ok = safe_teardown(sv, proc.pid, pgid, f"command exited {rc}; sweeping recorded leftovers")
-    sv.say(f"EXIT: command exited {rc}; clean={ok}")
+    sv.note(f"EXIT: command exited {rc}; clean={ok}")
     if ok:
         return rc
     return rc if rc != 0 else unclean(sv, rc)  # a failing command keeps its own code; a "successful" one does not pass
@@ -198,16 +236,22 @@ def safe_teardown(sv, root, pgid, reason):
     kills its own direct child (its Popen handle cannot name a reused pid); descendants are then unverified."""
     try:
         return sv.teardown(root, pgid, reason)
-    except Exception as e:
-        sv.say(f"teardown failed: {type(e).__name__}: {e}")
-        if sv.proc is not None and sv.proc.poll() is None:
-            sv.proc.kill()
-            sv.proc.wait()
-            sv.say(f"killed direct child {sv.proc.pid}; recorded descendants not verified")
+    except BaseException as e:
+        killed = False
+        try:  # the fallback before any logging
+            if sv.proc is not None and sv.proc.poll() is None:
+                sv.proc.kill()
+                sv.proc.wait()
+                killed = True
+        except ProcessLookupError:
+            pass
+        sv.note(f"teardown failed: {type(e).__name__}: {e}")
+        if killed:
+            sv.note(f"killed direct child {sv.proc.pid}; recorded descendants not verified")
         return False
 
 def unclean(sv, was):
-    sv.say(f"FAIL: teardown not clean; exit {UNCLEAN} (would have been {was})")
+    sv.note(f"FAIL: teardown not clean; exit {UNCLEAN} (would have been {was})")
     return UNCLEAN
 
 def stop(argv):
@@ -216,6 +260,7 @@ def stop(argv):
         rows = f.read().splitlines()
     pid, lstart = int(rows[0]), rows[1]
     argv = rows[2] if len(rows) > 2 else None
+    token = rows[3] if len(rows) > 3 else None
     t = ps_table()
     # identity = pid + start time + the exact argv ps showed when `run` began (older id files: argv must name groupwatch run)
     ok_argv = (t[pid][3] == argv) if (pid in t and argv is not None) else (pid in t and "groupwatch.py run" in t[pid][3])
@@ -226,18 +271,21 @@ def stop(argv):
     for _ in range(100):
         t = ps_table()
         if pid not in t or t[pid][2] != lstart:
-            return verdict(state, pid)
+            return verdict(state, pid, token)
         time.sleep(0.3)
     print("supervisor still running")
     return 1
 
-def verdict(state, pid):
-    """0 only if this supervisor's own final EXIT/ABORT line (after its start line in the shared log) says clean=True and
-    no FAIL line follows it."""
+def verdict(state, pid, token):
+    """0 only if this run's own final EXIT/ABORT line (by its token, after its own start line) says clean=True and no FAIL
+    line of its own follows it. Lines of any other run that shared the log are never read as this one's."""
+    if not token:
+        print(f"groupwatch stop: supervisor.id for {pid} has no run token, so its log lines cannot be told from another run's")
+        return UNCLEAN
     with open(os.path.join(state, "groupwatch.log")) as f:
-        lines = f.read().splitlines()
-    starts = [i for i, l in enumerate(lines) if f" supervisor pid {pid} started child " in l]
-    mine = lines[starts[-1] + 1:] if starts else []
+        own = [l for l in f.read().splitlines() if l.split(" ", 2)[1:2] == [f"[{token}]"]]
+    starts = [i for i, l in enumerate(own) if f" supervisor pid {pid} started child " in l]
+    mine = own[starts[-1] + 1:] if starts else []
     ends = [i for i, l in enumerate(mine) if " EXIT: " in l or " ABORT: " in l]
     final = [mine[i] for i in ends]
     failed = bool(ends) and any(" FAIL: " in l for l in mine[ends[-1] + 1:])
