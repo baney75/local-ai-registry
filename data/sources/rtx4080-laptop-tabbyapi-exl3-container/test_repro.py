@@ -53,6 +53,9 @@ def serve(port, faults):
                     self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n"); self.wfile.flush(); time.sleep(0.005)
                 fin = "length" if f"{which}_length" in faults else "stop"
                 self.wfile.write(b"data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": fin}]}).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+                if "late_eof" in faults:
+                    time.sleep(0.5)  # [DONE] has reached the client; the stream closes half a second later
                 self.close_connection = True
                 return
             msg, kind = {"role": "assistant", "content": ""}, "chat"
@@ -96,7 +99,11 @@ case "$1" in
       exists) [ -n "${FAKE_IMAGE_ABSENT:-}" ] && [ ! -e "$FAKE_STATE/pulled" ] && exit 1; exit 0 ;;
       inspect) echo "$FAKE_DIGEST" ;;
     esac ;;
-  pull) touch "$FAKE_STATE/pulled"; exit 0 ;;
+  pull)
+    if [ -n "${FAKE_PULL_HANG:-}" ]; then  # a slow pull, deaf to TERM, with a second process in its group
+      trap '' TERM; sleep "$FAKE_PULL_HANG" & exec sleep "$FAKE_PULL_HANG"
+    fi
+    touch "$FAKE_STATE/pulled"; exit 0 ;;
   run)
     shift; cid=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'); labels=(); port=
     while [ $# -gt 0 ]; do
@@ -228,6 +235,13 @@ class Repro(unittest.TestCase):
         open(os.path.join(self.state, "c", self.foreign, "labels"), "w").write("sybil.run=SOMEONE-ELSE\n")
 
     def tearDown(self):
+        for pat in [self.t] + ([f"^sleep {self.hang}$"] if getattr(self, "hang", None) else []):
+            for line in subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split():
+                if int(line) != os.getpid():
+                    try:
+                        os.kill(int(line), signal.SIGKILL)
+                    except Exception:
+                        pass
         for d in os.listdir(os.path.join(self.state, "c")):  # never leave a fake server behind, even on failure
             pid = os.path.join(self.state, "c", d, "pid")
             if os.path.exists(pid):
@@ -246,8 +260,12 @@ class Repro(unittest.TestCase):
             r = subprocess.run(["bash", os.path.join(self.repo, REL, "repro.sh")], env={**self.env, **env}, stdin=subprocess.DEVNULL,
                                stdout=f, stderr=subprocess.STDOUT, timeout=timeout,
                                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
-        self.out = open(out).read()
         self.elapsed = time.monotonic() - t0
+        for _ in range(50):  # the run's logger (tee) may still be writing its last lines
+            if not subprocess.run(["pgrep", "-f", f"tee -a {self.store}/"], capture_output=True).stdout:
+                break
+            time.sleep(0.1)
+        self.out = open(out).read()
         return r.returncode
 
     def ours(self):
@@ -268,9 +286,25 @@ class Repro(unittest.TestCase):
         left = subprocess.run(["pgrep", "-af", self.t], capture_output=True, text=True).stdout
         self.assertEqual([l for l in left.splitlines() if "pgrep" not in l], [], "helper or server process left behind")
 
+    def tree(self):
+        import hashlib
+        out = {}
+        for top in ("lab", "registry", REL):
+            for dp, dn, fn in os.walk(os.path.join(self.repo, top)):
+                dn[:] = [d for d in dn if d != "__pycache__"]
+                for f in fn:
+                    q = os.path.join(dp, f)
+                    out[os.path.relpath(q, self.repo)] = hashlib.sha256(open(q, "rb").read()).hexdigest()
+        return out
+
     def test_qualified(self):
+        before = self.tree()
         rc = self.run_repro()
         self.assertEqual(rc, 0, self.out[-3000:])
+        self.assertEqual(self.tree(), before, "the checkout was written")  # the lab ran in STORE/run-<id>/lab-root
+        R0 = self.run_dir()
+        self.assertTrue(os.path.exists(os.path.join(R0, "stock-recipe.json")))  # the lab's rewritten recipe, kept in the run dir
+        self.assertTrue(any(f.startswith("rtx-4080-laptop-12gb.") and f.endswith(".json") for f in os.listdir(R0)))
         R = self.run_dir()
         pc = json.load(open(os.path.join(R, "postconditions.json")))
         self.assertTrue(pc["pass"]); self.assertEqual(len([c for c in pc["chat_records"] if "n" in c]), 7)
@@ -322,8 +356,9 @@ class Repro(unittest.TestCase):
         rc = self.run_repro(FAKE_LABEL_OVERRIDE="SOMEONE-ELSE")
         self.assertEqual(rc, 5, self.out[-2000:])
         cid = self.ours()[0]
-        after = self.calls().split("run -d", 1)[1]
-        self.assertNotIn(f"logs --timestamps {cid}", after); self.assertNotIn(f"rm -f -t 20 {cid}", after); self.assertNotIn(f"kill {cid}", after)
+        after = self.calls().split("run -d", 1)[1].splitlines()
+        touched = [l for l in after if l.split()[:1] in (["rm"], ["kill"], ["logs"], ["stop"]) and cid in l]
+        self.assertEqual(touched, [], "a container that is not verifiably this run's was logged, stopped or removed")
         self.assertIn("left untouched", self.out)
 
     def test_gpu_busy(self):
@@ -359,7 +394,30 @@ class Repro(unittest.TestCase):
 
     def test_overall_timeout_cleans_up(self):
         rc = self.run_repro(FAKE_FAULTS="hang_context", REPRO_TIMEOUT="25")
-        self.assertIn(rc, (124, 143), self.out[-2000:]); self.assertIn("cleanup", self.out); self.assertClean()
+        self.assertIn(rc, (124, 143), self.out[-2000:]); self.assertIn("cleanup verdict", self.out); self.assertClean()
+        self.assertLess(self.elapsed, 25 + 60)  # the lab stage is stopped at once, not when its own bound runs out
+
+    # ---- Tier 2 r1 F5: the overall deadline lands in a long stage that does not depend on the recorder (a pull
+    # that ignores TERM and has a second process in its group); the stage must be stopped and cleanup finish
+    def test_deadline_in_slow_pull(self):
+        import random, re
+        self.hang = str(7000000 + random.randrange(1000000))
+        rc = self.run_repro(timeout=200, FAKE_IMAGE_ABSENT="1", FAKE_PULL_HANG=self.hang, REPRO_TIMEOUT="20")
+        self.assertIn(rc, (124, 143), self.out[-2000:])
+        self.assertIn("stopping the running stage", self.out)
+        self.assertTrue(re.search(r"cleanup verdict: ok=1 after \d+s of 540s", self.out), self.out[-2000:])
+        self.assertLess(self.elapsed, 20 + 60)  # TERM, the pull's 10 s grace, then KILL of its group
+        left = subprocess.run(["pgrep", "-f", f"^sleep {self.hang}$"], capture_output=True, text=True).stdout.split()
+        self.assertEqual(left, [], "the stage or its grandchild survived")
+        self.assertNotIn("run -d", self.calls()); self.assertClean()
+
+    # ---- Tier 2 r1 F6: [DONE] reaches the client half a second before the stream closes
+    def test_late_eof_after_done(self):
+        rc = self.run_repro(FAKE_FAULTS="late_eof")
+        self.assertEqual(rc, 0, self.out[-3000:])
+        rows = [json.loads(l) for l in open(os.path.join(self.run_dir(), "recorder.jsonl"))]  # every line parses
+        self.assertEqual(len([r for r in rows if r["method"] == "POST" and r["path"] == "/v1/chat/completions"]), 7)
+        self.assertClean()
 
     # ---- idle / no-gaming policy (Sol r2 finding 2): never start a container on a busy or unknown GPU
     def assertBusy(self, needle, **env):
@@ -501,6 +559,87 @@ class Repro(unittest.TestCase):
 
     def test_container_start_failure(self):
         self.assertEqual(self.run_repro(FAKE_RUN_FAIL="1"), 5); self.assertClean()
+
+
+class RecorderShutdown(unittest.TestCase):
+    """A client that stops at [DONE] and a recorder stopped at once: the row must still be written, whole."""
+    def test_term_right_after_done_keeps_the_row(self):
+        up_port, rec_port = free_port(), free_port()
+        d = tempfile.mkdtemp(prefix="sybil-repro-test-rec-")
+        up = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--serve", str(up_port), "late_eof"])
+        rec = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "finish_recorder.py"), str(rec_port), str(up_port), os.path.join(d, "rec")])
+        try:
+            for _ in range(100):
+                try:
+                    socket.create_connection(("127.0.0.1", rec_port), 0.2).close(); socket.create_connection(("127.0.0.1", up_port), 0.2).close(); break
+                except OSError:
+                    time.sleep(0.05)
+            body = json.dumps({"model": "m", "stream": True, "messages": [{"role": "user", "content": "story"}]}).encode()
+            s = socket.create_connection(("127.0.0.1", rec_port), 5)
+            s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            buf = b""
+            while b"data: [DONE]" not in buf:
+                chunk = s.recv(65536)
+                self.assertTrue(chunk, "stream ended before [DONE]")
+                buf += chunk
+            rec.send_signal(signal.SIGTERM)  # at once, while the upstream still holds the stream open
+            self.assertEqual(rec.wait(10), 0)
+            s.close()
+            rows = [json.loads(l) for l in open(os.path.join(d, "rec.jsonl"))]
+            chat = [r for r in rows if r["path"] == "/v1/chat/completions"]
+            self.assertEqual(len(chat), 1, rows)
+            self.assertEqual(chat[0]["finish_reasons"], ["stop"])
+        finally:
+            for p in (rec, up):
+                if p.poll() is None:
+                    p.kill(); p.wait()
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class WeightsContract(unittest.TestCase):
+    """verify_weights.py: exactly the manifest's files; a real .cache directory is the one extra allowed."""
+    def setUp(self):
+        import hashlib
+        self.d = tempfile.mkdtemp(prefix="sybil-repro-test-w-")
+        self.m = os.path.join(self.d, "model"); os.makedirs(self.m)
+        lines = []
+        for name, data in (("config.json", b"{}"), ("model.safetensors", b"x" * 100)):
+            open(os.path.join(self.m, name), "wb").write(data)
+            lines.append(f"sha256 {hashlib.sha256(data).hexdigest()} {len(data)} {name}")
+        self.manifest = os.path.join(self.d, "manifest"); open(self.manifest, "w").write("\n".join(lines) + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def check(self):
+        return subprocess.run([sys.executable, "-I", os.path.join(HERE, "verify_weights.py"), self.manifest, self.m], capture_output=True, text=True).returncode
+
+    def test_exact(self):
+        self.assertEqual(self.check(), 0)
+
+    def test_hf_cache_directory_allowed(self):
+        os.makedirs(os.path.join(self.m, ".cache", "huggingface", "download"))
+        self.assertEqual(self.check(), 0)
+
+    def test_cache_as_file_rejected(self):
+        open(os.path.join(self.m, ".cache"), "w").write("x")
+        self.assertEqual(self.check(), 1)
+
+    def test_cache_symlink_rejected(self):
+        os.makedirs(os.path.join(self.d, "elsewhere")); os.symlink(os.path.join(self.d, "elsewhere"), os.path.join(self.m, ".cache"))
+        self.assertEqual(self.check(), 1)
+
+    def test_other_dot_directory_rejected(self):
+        os.makedirs(os.path.join(self.m, ".git"))
+        self.assertEqual(self.check(), 1)
+
+    def test_extra_file_rejected(self):
+        open(os.path.join(self.m, "extra.bin"), "w").write("x")
+        self.assertEqual(self.check(), 1)
+
+    def test_changed_file_rejected(self):
+        open(os.path.join(self.m, "config.json"), "w").write("{ }")
+        self.assertEqual(self.check(), 1)
 
 
 class Manifest(unittest.TestCase):

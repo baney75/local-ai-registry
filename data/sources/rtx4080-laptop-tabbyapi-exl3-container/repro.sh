@@ -2,15 +2,21 @@
 # Reproduce the RTX 4080 Laptop GPU proof of qwen3.5-9b.tabbyapi.128k: the frozen
 # tabbyapi-qwen3.5-9b-exl3-4bpw-128k launch in rootless Podman, the unchanged stock lab through a
 # pass-through finish-reason recorder, one uncapped repeat of the stock speed request, and a check that
-# all seven chat completions ended naturally. Linux, NVIDIA driver, rootless Podman, flock, Python 3.11+.
-# It changes no GPU, driver, clock, power or OS setting and never touches a process or container it did
-# not start.
+# all seven chat completions ended naturally. Linux, NVIDIA driver, rootless Podman, flock, procps
+# (pgrep), Python 3.11+. It changes no GPU, driver, clock, power or OS setting and never touches a process
+# or container it did not start.
+#
+# Files it writes: only under STORE (the Podman storage, the lock and STORE/run-<id>/). The checkout is
+# read, never written. The stock lab runs in a scratch copy of lab/ and registry/ at STORE/run-<id>/lab-root,
+# so the recipe it rewrites with the new proof and its lab/runs/ output stay there; the run directory keeps
+# copies (stock-recipe.json and the run JSON).
 #
 #   MODEL_DIR=/path/to/Qwen3.5-9B-EXL3-6hb-4bpw STORE=/path/to/roomy/dir \
 #     bash data/sources/rtx4080-laptop-tabbyapi-exl3-container/repro.sh
 #
-# MODEL_DIR holds TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef (13 files, checked
-# against weights.manifest). STORE gets the Podman storage, the run lock and one run-<id>/ directory per
+# MODEL_DIR holds TheMelonGod/Qwen3.5-9B-exl3@e98453aa143a24fab9eb14b718daed02e2fa6eef: exactly the 13 files
+# of weights.manifest, checked by size and hash. The one other entry allowed is a real `.cache` directory
+# (what `huggingface-cli download --local-dir` leaves); anything else fails the check. STORE gets the Podman storage, the run lock and one run-<id>/ directory per
 # run. Optional: LIBDIR (host driver libraries, default /usr/lib), SERVER_PORT (15000), REC_PORT (15001),
 # PYTHON (python3), and the bounds REPRO_TIMEOUT (7200 s), HEALTH_TIMEOUT (900), LAB_TIMEOUT (5400),
 # REPEAT_TIMEOUT (1800).
@@ -30,11 +36,19 @@
 # battery, a mains or USB supply must be online. Where `parish-media` is installed, its `status` must also
 # exit 0 with ac_online true and not_ready null.
 #
+# Stages. Every long step (render, weights check, image check, pull and inspect, container start, the lab,
+# the repeat, the postconditions) runs in the background under its own `timeout -k K B`, which puts it in
+# its own process group, and the script waits for it. A signal interrupts that wait at once; cleanup then
+# stops the stage first: TERM to its `timeout` (which passes it on to the stage and its group and KILLs
+# them after K s), then KILL to whatever of that process group is left, then a check that nothing of it
+# remains. Only short calls run in the foreground; the longest is `parish-media status` (timeout -k 5 20).
+#
 # Cleanup reserve. On REPRO_TIMEOUT the outer `timeout` sends TERM and allows CLEANUP_RESERVE seconds before
 # KILL. Every cleanup step has its own `timeout -k 5 B` (worst case B + 5 s), so the reserve covers the worst
 # complete path, with at most two container ids (this run makes one `podman run`; a cidfile id plus a
 # label match is the most there can be):
-#   TERM deferred while the foreground command ends (lab/repeat: timeout -k 30)     35
+#   either a short foreground call finishing (parish-media 20 + 5) 25, or stopping
+#     the running stage (its -k grace, at most 30, + 5, then KILL of its group) 36    36
 #   label enumeration (ps 10)                                                       15
 #   per id x 2: owner check (inspect 10) 15, log (logs 30) 35, inspect (10) 15,
 #     rm -t 10 (25) 30, absence (exists 10, ps 10) 30, kill (10) 15, rm -t 0 (20) 25,
@@ -43,7 +57,7 @@
 #   helper fence: TERM, 10 s wait, KILL                                             12
 #   GPU readback (2 x nvidia-smi 10)                                                30
 #   writes and stamps                                                                5
-#   total                                                                          502  -> CLEANUP_RESERVE=540
+#   total                                                                          503  -> CLEANUP_RESERVE=540
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -73,12 +87,14 @@ RUN=$STORE/run-$RUNID
 mkdir "$RUN" || { echo "cannot create a fresh $RUN" >&2; exit 4; }
 trap '' PIPE  # a closed log pipe must not kill cleanup
 exec > >(trap '' INT TERM; exec tee -a "$RUN/repro.log") 2>&1  # the logger outlives a TERM so cleanup is logged
+exec 7>&1  # the logger again: a signal can arrive inside a call whose output is redirected (a stage's log),
+           # and the EXIT trap points stdout and stderr back here first. Closed for every child (7>&-).
 stamp() { echo "[$(date -u +%FT%TZ)] $*"; }
 stamp "run $RUNID in $RUN"
 
 CLEANUP_RESERVE=540
-RC=0; CREATED=0; CLEANED=0; IN_CLEANUP=0; SIGNALLED=; REC=; REC_T=
-t() { local b=$1; shift; timeout -k 5 "$b" "$@"; }  # every bounded call: worst case b + 5 s
+RC=0; CREATED=0; CLEANED=0; IN_CLEANUP=0; SIGNALLED=; REC=; REC_T=; STAGE=; STAGE_T=
+t() { local b=$1; shift; timeout -k 5 "$b" "$@" 7>&-; }  # every bounded call: worst case b + 5 s
 
 # Start time of a process (field 22 of /proc/<pid>/stat, read after the command name); fails if it is
 # gone or a zombie. Used to signal only processes this run started.
@@ -102,6 +118,42 @@ fenced_kill() {
   done
   kill -9 "$pid" 2>/dev/null; sleep 0.5
   [ "$(proc_start "$pid")" = "$want" ] && { echo "fence: helper $pid survived KILL"; return 1; }
+  return 0
+}
+
+# stage B K cmd...: run cmd in the background under `timeout -k K B` (its own process group) and wait for it.
+# Redirections on the call apply to the stage. A trapped signal interrupts the wait at once; outside cleanup
+# the trap ends the run, and cleanup's stop_stage stops the stage before anything else.
+stage() {
+  local b=$1 k=$2 rc
+  shift 2
+  timeout -k "$k" "$b" "$@" < /dev/null 7>&- 9>&- &
+  STAGE=$!; STAGE_T=$(proc_start "$STAGE")
+  while :; do
+    wait "$STAGE"; rc=$?
+    [ -n "$STAGE_T" ] && [ "$(proc_start "$STAGE")" = "$STAGE_T" ] || break  # still running: the wait was interrupted
+  done
+  STAGE=; STAGE_T=
+  return "$rc"
+}
+# Stop the running stage: TERM its `timeout` (it passes TERM to the stage and its process group, then KILLs
+# them after its -k grace), wait up to 35 s, KILL anything left in that process group, and require it empty.
+# The group id is the stage's `timeout` pid; Linux does not reuse a pid while a process group still uses it.
+stop_stage() {
+  local pid=$STAGE want=$STAGE_T i
+  [ -n "$pid" ] || return 0
+  if [ "$(proc_start "$pid")" = "$want" ]; then
+    stamp "stopping the running stage (timeout pid $pid)"
+    kill -TERM "$pid" 2>/dev/null
+    for i in $(seq 1 175); do
+      [ "$(proc_start "$pid")" = "$want" ] || break
+      sleep 0.2
+    done
+  fi
+  if pgrep -g "$pid" > /dev/null 2>&1; then kill -KILL -- "-$pid" 2>/dev/null; sleep 0.5; fi
+  if pgrep -g "$pid" > /dev/null 2>&1; then stamp "stage process group $pid survived KILL"; return 1; fi
+  wait "$pid" 2>/dev/null
+  STAGE=; STAGE_T=
   return 0
 }
 
@@ -193,6 +245,7 @@ cleanup() {
   CLEANED=1
   local ok=1 cid left ids=() t0=$SECONDS
   stamp "cleanup (reserve ${CLEANUP_RESERVE}s)"
+  stop_stage || ok=0
   if [ "$CREATED" = 1 ]; then
     [ -s "$RUN/container.cid" ] && ids+=("$(cat "$RUN/container.cid")")
     # a create that never wrote its cidfile still carries this run's unique label
@@ -237,7 +290,7 @@ on_signal() {
   fi
   RC=$1; exit "$1"
 }
-trap 'S=$?; IN_CLEANUP=1; [ "$RC" -eq 0 ] && RC=$S; cleanup; exit $RC' EXIT  # an unexpected exit keeps its status
+trap 'S=$?; exec 1>&7 2>&7; IN_CLEANUP=1; [ "$RC" -eq 0 ] && RC=$S; cleanup; exit $RC' EXIT  # an unexpected exit keeps its status
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 fail() { RC=$1; shift; stamp "$*"; exit "$RC"; }
@@ -249,16 +302,16 @@ flock -n 9 || fail 7 "another run holds $STORE/repro.lock"
 # 1. Inputs
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || fail 4 "Python 3.11 or newer is required"
 [ "$(sha256sum "$ROOT/lab/lab.py" | cut -d' ' -f1)" = "$LAB_SHA" ] || fail 4 "lab/lab.py is not the stock lab"
-(cd "$ROOT" && "$PYTHON" -I -c '
+stage 60 5 "$PYTHON" -I -c '
 import json, sys
-sys.path.insert(0, "lab"); import lab
+sys.path.insert(0, sys.argv[4] + "/lab"); import lab
 L = lab.render(json.load(open(sys.argv[1])))
 json.dump(L, open(sys.argv[2], "w"), indent=1, sort_keys=True)
 open(sys.argv[3], "w").write(L["config"]["text"])
-print(lab.launch_hash(L))' "$RECIPE" "$RUN/launch.json" "$RUN/config.yml" > "$RUN/launch.sha256") 9>&- || fail 4 "cannot render $RECIPE"
+print(lab.launch_hash(L))' "$ROOT/$RECIPE" "$RUN/launch.json" "$RUN/config.yml" "$ROOT" > "$RUN/launch.sha256" || fail 4 "cannot render $RECIPE"
 [ "$(cat "$RUN/launch.sha256")" = "$LAUNCH_SHA" ] || fail 4 "rendered launch $(cat "$RUN/launch.sha256") is not the measured one"
 [ "$(sha256sum "$RUN/config.yml" | cut -d' ' -f1)" = "$CONFIG_SHA" ] || fail 4 "config file is not the measured one"
-timeout -k 10 900 "$PYTHON" -I "$HERE/verify_weights.py" "$HERE/weights.manifest" "$MODEL_DIR" > "$RUN/weights-verify.txt" 9>&- \
+stage 900 10 "$PYTHON" -I "$HERE/verify_weights.py" "$HERE/weights.manifest" "$MODEL_DIR" > "$RUN/weights-verify.txt" \
   || { cat "$RUN/weights-verify.txt"; fail 4 "weights do not match weights.manifest"; }
 for d in /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools; do [ -c "$d" ] || fail 4 "missing $d"; done
 NAME_SEEN=$(t 10 nvidia-smi --query-gpu=name --format=csv,noheader 9>&-) || fail 3 "nvidia-smi failed"
@@ -275,15 +328,16 @@ for port in "$SERVER_PORT" "$REC_PORT"; do
   "$PYTHON" -c 'import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) else 1)' "$port" \
     || fail 4 "port $port is in use"
 done
-if ! timeout -k 5 60 "${P[@]}" image exists "$IMAGE" 9>&-; then
+if ! stage 60 5 "${P[@]}" image exists "$IMAGE"; then
   stamp "pulling $IMAGE"
-  timeout -k 10 3000 "${P[@]}" pull "$IMAGE" 9>&- || fail 4 "pull failed"
+  stage 3000 10 "${P[@]}" pull "$IMAGE" || fail 4 "pull failed"
 fi
-[ "$(timeout -k 5 60 "${P[@]}" image inspect "$IMAGE" --format '{{.Digest}}' 9>&-)" = "sha256:${IMAGE##*@sha256:}" ] || fail 4 "image digest mismatch"
+stage 60 5 "${P[@]}" image inspect "$IMAGE" --format '{{.Digest}}' > "$RUN/image-digest.txt" || fail 4 "image inspect failed"
+[ "$(cat "$RUN/image-digest.txt")" = "sha256:${IMAGE##*@sha256:}" ] || fail 4 "image digest mismatch"
 { date -u +%FT%TZ; free -b; t 10 nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,driver_version --format=csv; } > "$RUN/baseline.txt" 2>&1 9>&-
 
 # 2. Recorder in front of the server: forwards unchanged, logs every finish reason and raw body
-"$PYTHON" -I "$HERE/finish_recorder.py" "$REC_PORT" "$SERVER_PORT" "$RUN/recorder" 9>&- & REC=$!; REC_T=$(proc_start $REC)
+"$PYTHON" -I "$HERE/finish_recorder.py" "$REC_PORT" "$SERVER_PORT" "$RUN/recorder" < /dev/null 7>&- 9>&- & REC=$!; REC_T=$(proc_start $REC)
 [ -n "$REC_T" ] || fail 4 "recorder did not start"
 
 # 3. Server: the rendered launch's image, entrypoint, args, env, shm, weights mount and config file; the
@@ -291,11 +345,11 @@ fi
 idle_or_fail "launch" 9>&-  # immediately before the container: the pull above can take long
 stamp "starting container"
 CREATED=1
-timeout -k 10 120 "${P[@]}" run -d --name "sybil-repro-$RUNID" --cidfile "$RUN/container.cid" --label "sybil.run=$RUNID" \
+stage 120 10 "${P[@]}" run -d --name "sybil-repro-$RUNID" --cidfile "$RUN/container.cid" --label "sybil.run=$RUNID" \
   --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools "${LIBS[@]}" \
   -e NVIDIA_VISIBLE_DEVICES=all --shm-size 8g -p "127.0.0.1:$SERVER_PORT:5000" \
   -v "$MODEL_DIR:/workspace/models/Qwen3.5-9B-EXL3-6hb-4bpw:ro" -v "$RUN/config.yml:/app/config.yml:ro" \
-  --entrypoint /opt/venv/bin/python3 "$IMAGE" main.py --config /app/config.yml > /dev/null 9>&- || fail 5 "podman run failed"
+  --entrypoint /opt/venv/bin/python3 "$IMAGE" main.py --config /app/config.yml > /dev/null || fail 5 "podman run failed"
 CID=$(cat "$RUN/container.cid" 2>/dev/null)
 is_owned "$CID" || fail 5 "the started container is not verifiably this run's"
 stamp "container $CID"
@@ -303,25 +357,34 @@ stamp "container $CID"
 DEADLINE=$((SECONDS + HEALTH_TIMEOUT)); READY=no
 while [ $SECONDS -lt $DEADLINE ]; do
   if timeout -k 2 5 curl --max-time 4 -sf "http://127.0.0.1:$SERVER_PORT/v1/models" > "$RUN/models.json"; then READY=yes; break; fi
-  [ "$(timeout -k 5 30 "${P[@]}" inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)" = true ] || { stamp "server exited during load"; break; }
+  [ "$(t 10 "${P[@]}" inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)" = true ] || { stamp "server exited during load"; break; }
   sleep 5
 done
 [ "$READY" = yes ] || fail 6 "server not healthy within ${HEALTH_TIMEOUT}s"
 stamp "healthy"
 
-# 4. The stock lab, unchanged, through the recorder
-cd "$ROOT"
-stamp "lab try"
-timeout -k 30 "$LAB_TIMEOUT" "$PYTHON" lab/lab.py try "$WEIGHTS" --model qwen3.5-9b --engine tabbyapi-qwen3.5-9b-exl3-4bpw-128k \
-  --card rtx-4080-laptop-12gb --on endpoint --endpoint "http://127.0.0.1:$REC_PORT" --gpu "$GPU_NAME" 9>&- 2>&1 | tee "$RUN/lab-try.log"
-LAB=${PIPESTATUS[0]}
+# 4. The stock lab, unchanged, through the recorder, in a scratch copy of lab/ and registry/ so the checkout
+# stays untouched (the lab rewrites the recipe with its new proof and writes lab/runs/)
+LR=$RUN/lab-root
+mkdir -p "$LR/lab/runs" || fail 4 "cannot make $LR"
+(cd "$ROOT" && tar --exclude=./runs --exclude=__pycache__ -C lab -cf - . | tar -C "$LR/lab" -xf - && cp -a registry "$LR/registry") \
+  || fail 4 "cannot copy lab/ and registry/ to $LR"
+[ "$(sha256sum "$LR/lab/lab.py" | cut -d' ' -f1)" = "$LAB_SHA" ] || fail 4 "the scratch lab/lab.py is not the stock lab"
+cmp -s "$ROOT/$RECIPE" "$LR/$RECIPE" || fail 4 "the scratch recipe differs from the checkout's"
+cd "$LR"
+stamp "lab try (in $LR)"
+stage "$LAB_TIMEOUT" 30 "$PYTHON" lab/lab.py try "$WEIGHTS" --model qwen3.5-9b --engine tabbyapi-qwen3.5-9b-exl3-4bpw-128k \
+  --card rtx-4080-laptop-12gb --on endpoint --endpoint "http://127.0.0.1:$REC_PORT" --gpu "$GPU_NAME" > "$RUN/lab-try.log" 2>&1
+LAB=$?
+cat "$RUN/lab-try.log"
 echo "$LAB" > "$RUN/lab.exit"
 stamp "lab exit $LAB"
 find lab/runs -maxdepth 1 -name 'rtx-4080-laptop-12gb.*' -newer "$RUN/config.yml" -exec cp -p {} "$RUN/" \;
+cmp -s "$ROOT/$RECIPE" "$LR/$RECIPE" || cp -p "$LR/$RECIPE" "$RUN/stock-recipe.json"
 
 # 5. One independent repeat of the stock speed request with the lab's own stream_rate, uncapped
 if [ "$LAB" -eq 0 ]; then
-  timeout -k 30 "$REPEAT_TIMEOUT" "$PYTHON" -c '
+  stage "$REPEAT_TIMEOUT" 30 "$PYTHON" -c '
 import json, sys, time
 sys.path.insert(0, "lab"); import lab
 ep = sys.argv[1]
@@ -329,14 +392,22 @@ served = lab.call(ep, "/v1/models", timeout=30)[0]["data"][0]["id"]
 t = time.time()
 tps, total, secs = lab.stream_rate(ep, served, "Write a detailed 600-word story about a lighthouse keeper.")
 print(json.dumps({"at": t, "served": served, "tps": round(tps, 1), "tokens_total": total, "seconds_total": round(secs, 1), "min_tps": lab.MIN_TPS, "pass": tps >= lab.MIN_TPS}))
-' "http://127.0.0.1:$REC_PORT" > "$RUN/speed-repeat.json" 2> "$RUN/speed-repeat.err" 9>&-
+' "http://127.0.0.1:$REC_PORT" > "$RUN/speed-repeat.json" 2> "$RUN/speed-repeat.err"
   echo $? > "$RUN/repeat.exit"
   stamp "repeat exit $(cat "$RUN/repeat.exit"): $(cat "$RUN/speed-repeat.json")"
 fi
 
-# 6. Postconditions: exactly 7 chat completions, HTTP 200, no caps, every one ended naturally
+# 6. Postconditions: exactly 7 chat completions, HTTP 200, no caps, every one ended naturally. Before the
+# recorder stops, wait (at most 10 s) for its seventh chat row; its TERM handler then stops taking requests
+# and lets in-flight handlers finish writing their rows before it exits.
+if [ "$LAB" -eq 0 ]; then
+  for i in $(seq 1 50); do
+    [ "$(grep -c '"method": "POST", "path": "/v1/chat/completions"' "$RUN/recorder.jsonl" 2>/dev/null)" -ge 7 ] && break
+    sleep 0.2
+  done
+fi
 fenced_kill "$REC" "$REC_T"
-"$PYTHON" -I "$HERE/check_postconditions.py" "$RUN" > "$RUN/postconditions.out" 2>&1; PC=$?
+stage 60 5 "$PYTHON" -I "$HERE/check_postconditions.py" "$RUN" > "$RUN/postconditions.out" 2>&1; PC=$?
 stamp "postconditions exit $PC"
 [ "$LAB" -eq 0 ] || fail 1 "a lab gate failed"
 [ "$PC" -eq 0 ] || fail 8 "the repeat or a postcondition failed: $(grep -A3 failures "$RUN/postconditions.out" | tr -s ' \n' ' ')"

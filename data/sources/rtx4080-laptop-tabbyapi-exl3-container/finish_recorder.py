@@ -8,9 +8,12 @@ calls, error payloads, and for streams every finish_reason seen plus chunk count
 body, the raw response body of every non-streamed reply and the full SSE text of every stream go to
 OUT.bodies/. Request ids come from one locked counter, so concurrent requests never share an id.
 
+On SIGTERM it stops taking new connections, waits for every in-flight request to finish and write its
+row, and exits 0, so a row is never lost or torn when the recorder is stopped right after the last reply.
+
   finish_recorder.py LISTEN UPSTREAM OUT
 """
-import http.client, http.server, json, os, socketserver, sys, threading, time
+import http.client, http.server, json, os, signal, socketserver, sys, threading, time
 
 LISTEN, UPSTREAM, OUT = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 BODIES = OUT + ".bodies"
@@ -88,7 +91,10 @@ class H(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             row["proxy_error"] = repr(e)
             record(row)
-            self.send_error(502)
+            try:
+                self.send_error(502)
+            except OSError:
+                pass  # the client has gone too
             return
         row["status"] = r.status
         ctype = r.getheader("Content-Type") or ""
@@ -165,8 +171,13 @@ class H(http.server.BaseHTTPRequestHandler):
 
 
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
+    daemon_threads = False  # server_close() joins in-flight handlers, so each writes its row first
+    block_on_close = True
 
 
 if __name__ == "__main__":
-    S(("127.0.0.1", LISTEN), H).serve_forever()
+    srv = S(("127.0.0.1", LISTEN), H)
+    # shutdown() must come from another thread than serve_forever's
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
+    srv.serve_forever()
+    srv.server_close()
