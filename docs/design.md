@@ -75,7 +75,8 @@ Every download in these steps is `curl -q ...` (`-q` first, so no `.curlrc` is r
   entry `SITE` holds `rt/site`, and so does `site` when the target is `RT/site`); and the staged interpreter
   (so resolved inside the archive) must exist and run. Only then does each entry replace the
   one in `into` by rename. If the publication does not finish (a rename fails, or the step is stopped by TERM, INT or
-  HUP), every entry already moved is put back before anything is cleaned up, so the previous runtime stays whole and
+  HUP), every entry already moved is put back before anything is cleaned up (a further TERM, INT or HUP during the put-back is
+  ignored, so it always finishes), so the previous runtime stays whole and
   usable; if putting it back fails too, the previous copy is kept (not deleted), the step says where and fails. The same
   holds for the packages target and wheel dir and for a hub model directory. A KILL cannot be caught: it leaves the
   staging and backup directories in place, never deletes them. Other files in

@@ -482,6 +482,12 @@ if [ -n "$FAIL_MV_TO" ] && [ "$last" = "$FAIL_MV_TO" ]; then
     *.local-ai-*) echo "mv: injected failure" >&2; exit 1;;
   esac
 fi
+# with $RETERM (parent or group) every restore move first sends the step two more TERMs, to its shell or to its whole
+# process group (so the test must run the step in its own session)
+if [ -n "$RETERM" ]; then case "$1" in */old|*/old/*)
+  echo "$1" >> "$PWD/RETERMED"
+  if [ "$RETERM" = group ]; then kill -TERM 0; kill -TERM 0; else kill -TERM "$PPID"; kill -TERM "$PPID"; fi;;
+esac; fi
 # with $FAIL_ANY_RESTORE every move out of .../old (putting a backup back) fails
 if [ -n "$FAIL_ANY_RESTORE" ]; then case "$1" in */old|*/old/*) echo "mv: injected restore failure" >&2; exit 1;; esac; fi
 /bin/mv "$@" || exit
@@ -550,10 +556,18 @@ class SandboxTest(unittest.TestCase):
         (w / 'python3').write_text(TRAP); (w / 'python3').chmod(0o755)
         return w
 
-    def sh(self, code, work, shell=('sh', '-c'), **env):
-        return subprocess.run([*shell, code], cwd=work, capture_output=True, text=True,
-                              env={'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_SERVER': str(self.server), 'HOME': str(work),
-                                   'TRAPPED': str(work / 'TRAPPED'), 'FAKE_OUTSIDE': str(self.outside), **env})
+    def sh(self, code, work, shell=('sh', '-c'), session=False, **env):
+        """Run the step; with session=True in its own session, whose every process is killed if it outlives the timeout."""
+        p = subprocess.Popen([*shell, code], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=session,
+                             env={'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_SERVER': str(self.server), 'HOME': str(work),
+                                  'TRAPPED': str(work / 'TRAPPED'), 'FAKE_OUTSIDE': str(self.outside), **env})
+        try:
+            out, err = p.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, 9) if session else p.kill()
+            p.communicate()
+            raise
+        return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
     def step(self, L, title, work, sdk_name='python', **env):
         code = next(s['code'] for s in renderings(L)[sdk_name] if s['title'] == title)
@@ -1098,10 +1112,10 @@ class SandboxTest(unittest.TestCase):
         """The installation itself (not the test's own records such as PIP_ENV in the work dir)."""
         return {'rt': tree(w / 'rt'), 'launcher': tree(w / 'launcher')}
 
-    def interrupt(self, base, L, title, src, dst, name, shell, **env):
+    def interrupt(self, base, L, title, src, dst, name, shell, session=False, **env):
         w = self.work(); shutil.rmtree(w); shutil.copytree(base, w, symlinks=True)
         code = next(s['code'] for s in renderings(L)[name] if s['title'] == title)
-        r = self.sh(code, w, shell, KILL_FROM=src, KILL_TO=dst, **env)
+        r = self.sh(code, w, shell, session, KILL_FROM=src, KILL_TO=dst, **env)
         self.assertTrue((w / 'KILLED').exists(), f'the boundary {src} -> {dst} was never reached')
         (w / 'KILLED').unlink()
         return w, r
@@ -1149,6 +1163,36 @@ class SandboxTest(unittest.TestCase):
                     # the named backup holds the previous output, byte for byte
                     held = [k for k in kept if tree(w / k / Path(live).name if case.startswith('runtime') else w / k) == tree(base / live)]
                     self.assertTrue(held, f'{case} ({name}): the previous {live} is not in {kept}')
+
+    def test_repeated_term_during_rollback_cannot_cut_it_short(self):
+        """A TERM mid-publication, then two more during the restore itself, sent to the step's shell alone or to its whole
+        process group (its own session, so only test processes are signalled), under sh and dash: the previous installation
+        comes back, or if restoring fails the exact backup path is printed and the backup is kept."""
+        base, again = self.installed()
+        was = self.install_tree(base)
+        for case, live in (('runtime: python backed up', 'rt/python'), ('packages: target backed up', 'rt/site'),
+                           ('hub: model backed up', 'rt/hf-cache/models--org--model')):
+            title, src, dst = self.BOUNDARIES[case]
+            for name in ('python', 'js') if NODE else ('python',):
+                for shell in [('sh', '-c')] + ([('dash', '-c')] if shutil.which('dash') else []):
+                    for to in ('parent', 'group'):
+                        for fail in (False, True):
+                            with self.subTest(case=case, sdk=name, shell=shell[0], to=to, restore_fails=fail):
+                                w, r = self.interrupt(base, again, title, src, dst, name, shell, True, RETERM=to,
+                                                      **({'FAIL_ANY_RESTORE': '1'} if fail else {}))
+                                self.assertTrue((w / 'RETERMED').exists(), 'the rollback never reached its restore move')
+                                (w / 'RETERMED').unlink()
+                                if not fail:
+                                    self.assertEqual(self.install_tree(w), was, r.stderr[-800:])
+                                    self.assertEqual(staging_left(w), [])
+                                    if to == 'parent':
+                                        self.assertEqual(r.returncode, 143, r.stderr[-800:])
+                                    continue
+                                self.assertNotEqual(r.returncode, 0)
+                                kept = re.findall(r'previous copy is kept in (\S+)', r.stderr)
+                                self.assertTrue(kept, f'no backup named: {r.stderr[-600:]}')
+                                self.assertTrue([k for k in kept if tree(w / k / Path(live).name if case.startswith('runtime') else w / k) == tree(base / live)],
+                                                f'the previous {live} is not in {kept}')
 
     def test_failed_package_publish_restores_both(self):
         base = self.work(); self.install(base)

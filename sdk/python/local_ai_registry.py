@@ -208,8 +208,9 @@ _PIPENV = "pipenv() { h=$(cd -P \"$1\" && pwd -P)/.pip; mkdir -p \"$h/tmp\" \"$h
 
 # Every step's exit, by success, failure or a signal (TERM, INT, HUP), goes through fin: while a publication is unfinished
 # (pub set) the step's back() puts the previous installation back first, and if that fails the backup is kept (named on
-# stderr) and the step fails; only then are the staging directories removed. The same text in both SDKs.
-_TXN = "pub= c= o= s= t= w=\nfin() { rc=${1:-$?}; trap - EXIT TERM INT HUP; if [ -n \"$pub\" ] && ! back; then for k in ${s:+\"$s/old\"} ${o:+\"$o/old\"}; do if [ -e \"$k\" ]; then echo \"local-ai: could not restore it; the previous copy is kept in $k\" >&2; fi; done; exit 1; fi; for x in \"$c\" \"$o\" \"$s\" \"$t\" \"$w\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done; exit \"$rc\"; }\ntrap fin EXIT; trap 'fin 143' TERM; trap 'fin 130' INT; trap 'fin 129' HUP"
+# stderr) and the step fails; only then are the staging directories removed. fin ignores TERM, INT and HUP first (the
+# rollback's own children inherit that), so a repeated signal cannot cut the rollback short. The same text in both SDKs.
+_TXN = "pub= c= o= s= t= w=\nfin() { rc=${1:-$?}; trap '' TERM INT HUP; trap - EXIT; if [ -n \"$pub\" ] && ! back; then for k in ${s:+\"$s/old\"} ${o:+\"$o/old\"}; do if [ -e \"$k\" ]; then echo \"local-ai: could not restore it; the previous copy is kept in $k\" >&2; fi; done; exit 1; fi; for x in \"$c\" \"$o\" \"$s\" \"$t\" \"$w\"; do if [ -n \"$x\" ]; then rm -rf \"$x\"; fi; done; exit \"$rc\"; }\ntrap fin EXIT; trap 'fin 143' TERM; trap 'fin 130' INT; trap 'fin 129' HUP"
 _HUBUNDO = 'hubundo() { echo "local-ai: could not publish $1; restoring the previous one" >&2; exit 1; }'
 # the hub model directory being published: m (live) and ms (staged); the new one is placed once ms is gone
 _HUBBACK = "back() { ok=0; if [ ! -e \"$ms\" ]; then rm -rf \"$m\" || ok=1; fi; if [ -e \"$o/old\" ]; then mv \"$o/old\" \"$m\" || ok=1; fi; return $ok; }"
